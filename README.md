@@ -65,6 +65,25 @@ source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
 
+### Offline install
+
+Prepare the bundle on an online machine with the same OS, CPU architecture,
+and Python minor version as the offline machine:
+
+```bash
+python scripts/offline_install.py bundle hermes-offline
+```
+
+Copy `hermes-offline` to the offline machine, then install without an index:
+
+```bash
+python hermes-offline/offline_install.py install --venv ~/.hermes/hermes-agent/venv
+```
+
+The default bundle contains the curated `all` extra. Add lazy provider extras
+when preparing it, for example `--extras all,anthropic`. Python 3.11–3.13 must
+already be installed; model weights and external system packages are not bundled.
+
 ### Troubleshooting
 
 #### Windows Defender or antivirus flags `uv.exe` as malware

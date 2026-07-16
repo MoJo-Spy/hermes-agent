@@ -52,6 +52,23 @@ source ~/.bashrc    # 重新加载 shell（或: source ~/.zshrc）
 hermes              # 开始对话！
 ```
 
+### 离线安装
+
+先在与离线机器的 OS、CPU 架构和 Python minor version 相同的联网机器上生成离线包：
+
+```bash
+python scripts/offline_install.py bundle hermes-offline
+```
+
+将 `hermes-offline` 目录复制到离线机器，然后执行无索引安装：
+
+```bash
+python hermes-offline/offline_install.py install --venv ~/.hermes/hermes-agent/venv
+```
+
+默认打包精选的 `all` extra。需要离线使用延迟安装的 provider 时，在打包阶段显式加入，
+例如 `--extras all,anthropic`。离线机器需预装 Python 3.11–3.13；离线包不包含模型权重和系统级依赖。
+
 ---
 
 ## 快速入门
