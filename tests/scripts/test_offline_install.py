@@ -6,17 +6,34 @@ import pytest
 from scripts import offline_install
 
 
+def _write_runtime(bundle):
+    runtime = bundle / "runtime"
+    runtime.mkdir()
+    node = runtime / ("node.exe" if offline_install.sys.platform == "win32" else "node")
+    license_file = runtime / "NODE-LICENSE"
+    node.write_bytes(b"node")
+    license_file.write_bytes(b"license")
+    return {
+        "version": "v20.0.0",
+        "filename": node.name,
+        "sha256": hashlib.sha256(b"node").hexdigest(),
+        "license": license_file.name,
+        "license_sha256": hashlib.sha256(b"license").hexdigest(),
+    }
+
+
 def test_load_bundle_accepts_matching_runtime_and_rejects_corruption(tmp_path):
     wheels = tmp_path / "wheels"
     wheels.mkdir()
     wheel = wheels / "example.whl"
     wheel.write_bytes(b"wheel")
     manifest = {
-        "format": 1,
+        "format": 2,
         "hermes_version": "1.2.3",
         "extras": ["all"],
         **offline_install._runtime(),
         "wheels": {wheel.name: hashlib.sha256(b"wheel").hexdigest()},
+        "node": _write_runtime(tmp_path),
     }
     (tmp_path / offline_install.MANIFEST).write_text(json.dumps(manifest))
 
@@ -34,11 +51,12 @@ def test_load_bundle_accepts_matching_runtime_and_rejects_corruption(tmp_path):
 
 def test_load_bundle_rejects_incompatible_python(tmp_path):
     manifest = {
-        "format": 1,
+        "format": 2,
         "hermes_version": "1.2.3",
         "extras": [],
         **offline_install._runtime(),
         "wheels": {},
+        "node": _write_runtime(tmp_path),
     }
     manifest["python"] = "0.0"
     (tmp_path / offline_install.MANIFEST).write_text(json.dumps(manifest))
@@ -52,11 +70,12 @@ def test_install_rejects_nonempty_target(tmp_path):
     bundle.mkdir()
     (bundle / "wheels").mkdir()
     manifest = {
-        "format": 1,
+        "format": 2,
         "hermes_version": "1.2.3",
         "extras": [],
         **offline_install._runtime(),
         "wheels": {},
+        "node": _write_runtime(bundle),
     }
     (bundle / offline_install.MANIFEST).write_text(json.dumps(manifest))
     target = tmp_path / "target"

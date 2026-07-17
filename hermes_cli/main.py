@@ -1621,7 +1621,7 @@ def _ensure_tui_node() -> None:
     Idempotent no-op when node+npm are already discoverable. Set
     ``HERMES_SKIP_NODE_BOOTSTRAP=1`` to disable auto-install.
     """
-    if shutil.which("node") and shutil.which("npm"):
+    if _find_venv_node() or (shutil.which("node") and shutil.which("npm")):
         return
     if os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
         return
@@ -1665,6 +1665,13 @@ def _ensure_tui_node() -> None:
         if extra.is_dir() and s not in parts:
             parts.insert(0, s)
     os.environ["PATH"] = os.pathsep.join(parts)
+
+
+def _find_venv_node() -> str | None:
+    """Find a portable Node runtime installed beside the venv's Python."""
+    name = "node.exe" if sys.platform == "win32" else "node"
+    node = Path(sys.executable).resolve().parent / name
+    return str(node) if node.is_file() else None
 
 
 def _find_bundled_tui(hermes_cli_dir: Path | None = None) -> Path | None:
@@ -1742,7 +1749,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             env_node = os.environ.get("HERMES_NODE")
             if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
                 return env_node
-        path = shutil.which(bin)
+        path = _find_venv_node() if bin == "node" else None
+        path = path or shutil.which(bin)
         if not path and bin == "node":
             try:
                 from hermes_cli.dep_ensure import ensure_dependency
@@ -1766,9 +1774,6 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         )
         sys.exit(1)
 
-    if not ext_dir:
-        _ensure_tui_workspace(tui_dir)
-
     # 1. Prebuilt bundle (nix / packaged release): just run it.
     if not tui_dev:
         if ext_dir:
@@ -1782,6 +1787,9 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         if bundled is not None:
             node = _node_bin("node")
             return [node, "--expose-gc", str(bundled)], bundled.parent
+
+    if not ext_dir:
+        _ensure_tui_workspace(tui_dir)
 
     # 2. Normal flow: npm install if needed, always esbuild, then node dist/entry.js.
     #    --dev flow: npm install if needed, then tsx src/entry.tsx.

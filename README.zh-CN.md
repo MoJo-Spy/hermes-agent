@@ -66,8 +66,9 @@ python scripts/offline_install.py bundle hermes-offline
 python hermes-offline/offline_install.py install --venv ~/.hermes/hermes-agent/venv
 ```
 
-默认打包精选的 `all` extra。需要离线使用延迟安装的 provider 时，在打包阶段显式加入，
-例如 `--extras all,anthropic`。离线机器需预装 Python 3.11–3.13；离线包不包含模型权重和系统级依赖。
+默认打包精选的 `all` extra、预编译 TUI 和当前平台的 Node.js 20+ runtime。需要离线使用
+延迟安装的 provider 时，在打包阶段显式加入，例如 `--extras all,anthropic`。离线机器需预装
+Python 3.11–3.13；离线包不包含模型权重和其他系统级依赖。
 
 ---
 
