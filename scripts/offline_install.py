@@ -14,6 +14,7 @@ import tomllib
 import venv
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 from zipfile import ZipFile
 
 
@@ -45,7 +46,22 @@ def _spec(name: str, extras: list[str], version: str | None = None) -> str:
     return f"{name}{suffix}{f'=={version}' if version else ''}"
 
 
-def _prepare_tui(repo: Path) -> tuple[Path, Path, str]:
+def _node_license(node_path: Path, node_version: str) -> bytes:
+    for path in (node_path.parent / "LICENSE", node_path.parent / "LICENSE.txt"):
+        if path.is_file():
+            return path.read_bytes()
+
+    url = f"https://raw.githubusercontent.com/nodejs/node/{node_version}/LICENSE"
+    try:
+        with urlopen(url, timeout=30) as response:
+            return response.read()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Node.js LICENSE is missing beside {node_path} and could not be downloaded"
+        ) from exc
+
+
+def _prepare_tui(repo: Path) -> tuple[Path, bytes, str]:
     node = shutil.which("node")
     npm = shutil.which("npm")
     if not node or not npm:
@@ -57,16 +73,7 @@ def _prepare_tui(repo: Path) -> tuple[Path, Path, str]:
     ).strip()
     if int(node_version.removeprefix("v").split(".", 1)[0]) < 20:
         raise RuntimeError(f"Node.js 20+ is required, found {node_version}")
-    license_path = next(
-        (
-            path
-            for path in (node_path.parent / "LICENSE", node_path.parent / "LICENSE.txt")
-            if path.is_file()
-        ),
-        None,
-    )
-    if license_path is None:
-        raise RuntimeError(f"Node.js LICENSE not found beside {node_path}")
+    license_content = _node_license(node_path, node_version)
 
     lock = repo / "package-lock.json"
     lock_content = lock.read_bytes()
@@ -96,7 +103,7 @@ def _prepare_tui(repo: Path) -> tuple[Path, Path, str]:
     bundled_entry = repo / "hermes_cli" / "tui_dist" / "entry.js"
     bundled_entry.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(entry, bundled_entry)
-    return node_path, license_path, node_version
+    return node_path, license_content, node_version
 
 
 def build_bundle(output: Path, extras: list[str], repo: Path) -> None:
@@ -142,7 +149,7 @@ def build_bundle(output: Path, extras: list[str], repo: Path) -> None:
     bundled_node = runtime / node_name
     bundled_license = runtime / "NODE-LICENSE"
     shutil.copy2(node, bundled_node)
-    shutil.copy2(node_license, bundled_license)
+    bundled_license.write_bytes(node_license)
 
     manifest = {
         "format": 2,

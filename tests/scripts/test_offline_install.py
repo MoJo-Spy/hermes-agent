@@ -1,9 +1,29 @@
 import hashlib
+import io
 import json
 
 import pytest
 
 from scripts import offline_install
+
+
+def test_node_license_downloads_exact_version_when_not_installed(tmp_path, monkeypatch):
+    requested = {}
+
+    def fake_urlopen(url, timeout):
+        requested.update(url=url, timeout=timeout)
+        return io.BytesIO(b"node license")
+
+    monkeypatch.setattr(offline_install, "urlopen", fake_urlopen, raising=False)
+
+    assert (
+        offline_install._node_license(tmp_path / "node.exe", "v24.18.0")
+        == b"node license"
+    )
+    assert requested == {
+        "url": "https://raw.githubusercontent.com/nodejs/node/v24.18.0/LICENSE",
+        "timeout": 30,
+    }
 
 
 def _write_runtime(bundle):
