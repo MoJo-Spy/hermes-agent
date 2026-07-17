@@ -80,9 +80,10 @@ Copy `hermes-offline` to the offline machine, then install without an index:
 python hermes-offline/offline_install.py install --venv ~/.hermes/hermes-agent/venv
 ```
 
-The default bundle contains the curated `all` extra. Add lazy provider extras
-when preparing it, for example `--extras all,anthropic`. Python 3.11–3.13 must
-already be installed; model weights and external system packages are not bundled.
+The default bundle contains the curated `all` extra, a prebuilt TUI, and the
+current platform's Node.js 20+ runtime. Add lazy provider extras when preparing
+it, for example `--extras all,anthropic`. Python 3.11–3.13 must already be
+installed; model weights and other external system packages are not bundled.
 
 ### Troubleshooting
 
