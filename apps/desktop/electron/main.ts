@@ -101,6 +101,7 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { readOfflineEditionMarker } from './offline-edition'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import {
   buildSessionWindowUrl,
@@ -341,6 +342,11 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+const OFFLINE_EDITION_MARKER = path.join(HERMES_HOME, 'offline-install.json')
+
+function offlineEdition() {
+  return readOfflineEditionMarker(OFFLINE_EDITION_MARKER)
+}
 
 function hermesManagedNodePathEntries() {
   // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
@@ -2045,6 +2051,17 @@ async function resolveHealedBranch(updateRoot, branch) {
 }
 
 async function checkUpdates() {
+  const offline = offlineEdition()
+
+  if (offline) {
+    return {
+      supported: false,
+      offline: true,
+      reason: 'offline-edition',
+      version: offline.version
+    }
+  }
+
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
@@ -2418,6 +2435,10 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
+  if (offlineEdition()) {
+    throw new Error('Offline editions are updated by running a newer Hermes offline installer.')
+  }
+
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }
@@ -3019,9 +3040,10 @@ function readBootstrapMarker() {
 // "already installed" off the filesystem alone, not just the marker.
 function isActiveRuntimeUsable() {
   const venvPython = getVenvPython(VENV_ROOT)
+  const offline = offlineEdition()
 
   return (
-    isHermesSourceRoot(ACTIVE_HERMES_ROOT) &&
+    (Boolean(offline) || isHermesSourceRoot(ACTIVE_HERMES_ROOT)) &&
     fileExists(venvPython) &&
     canImportHermesCli(venvPython, {
       env: {
@@ -3283,7 +3305,7 @@ function createActiveBackend(backendArgs) {
       venvRoot: VENV_ROOT
     }),
     root: ACTIVE_HERMES_ROOT,
-    bootstrap: true,
+    bootstrap: !offlineEdition(),
     shell: false
   }
 }
@@ -8699,6 +8721,12 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
 // which historically drifted (stuck at 0.0.2). Falls back to app.getVersion()
 // when the source tree can't be read (e.g. a packaged build without the repo).
 function resolveHermesVersion() {
+  const offline = offlineEdition()
+
+  if (offline) {
+    return offline.version
+  }
+
   try {
     const root = resolveUpdateRoot()
     const initPath = path.join(root, 'hermes_cli', '__init__.py')

@@ -41,7 +41,7 @@ pub async fn run_script(
     args: &[String],
     sink: StreamSink,
     hermes_home_override: Option<&str>,
-    mut cancel_rx: Option<CancelRx>,
+    cancel_rx: Option<CancelRx>,
 ) -> Result<ScriptResult> {
     let mut cmd = build_command(script_path, args);
 
@@ -57,6 +57,44 @@ pub async fn run_script(
         cmd.env("HERMES_HOME", home);
     }
 
+    run_command(
+        cmd,
+        sink,
+        cancel_rx,
+        format!("{} via {}", script_path.display(), interpreter_label()),
+    )
+    .await
+}
+
+/// Spawns an arbitrary executable with the same line streaming and hidden
+/// Windows console behavior as install.ps1. Offline installation uses this to
+/// invoke the portable Python embedded in the installer payload.
+pub async fn run_program(
+    program: &Path,
+    args: &[String],
+    sink: StreamSink,
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    cancel_rx: Option<CancelRx>,
+) -> Result<ScriptResult> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    run_command(cmd, sink, cancel_rx, program.display().to_string()).await
+}
+
+async fn run_command(
+    mut cmd: Command,
+    sink: StreamSink,
+    mut cancel_rx: Option<CancelRx>,
+    label: String,
+) -> Result<ScriptResult> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -70,9 +108,7 @@ pub async fn run_script(
         cmd.creation_flags(0x0800_0000);
     }
 
-    let mut child: Child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {} via {}", script_path.display(), interpreter_label()))?;
+    let mut child: Child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -154,7 +190,10 @@ pub async fn run_script(
     })
 }
 
-fn stable_script_cwd<'a>(script_path: &'a Path, hermes_home_override: Option<&'a str>) -> Option<&'a Path> {
+fn stable_script_cwd<'a>(
+    script_path: &'a Path,
+    hermes_home_override: Option<&'a str>,
+) -> Option<&'a Path> {
     if let Some(home) = hermes_home_override {
         let path = Path::new(home);
         if path.is_dir() {

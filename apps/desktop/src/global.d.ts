@@ -300,6 +300,8 @@ export interface DesktopUpdateCommit {
 
 export interface DesktopUpdateStatus {
   supported: boolean
+  offline?: boolean
+  version?: string
   updateAvailable?: boolean
   branch?: string
   currentBranch?: string

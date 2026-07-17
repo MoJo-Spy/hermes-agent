@@ -299,7 +299,7 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
 }
 
 export async function checkBackendUpdates(): Promise<DesktopUpdateStatus | null> {
-  if (!isRemoteMode() || $backendUpdateChecking.get()) {
+  if ($updateStatus.get()?.offline || $updateChecking.get() || !isRemoteMode() || $backendUpdateChecking.get()) {
     return $backendUpdateStatus.get()
   }
 
@@ -364,6 +364,14 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
 
 export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promise<DesktopUpdateApplyResult> {
   const bridge = window.hermesDesktop?.updates
+
+  if ($updateStatus.get()?.offline) {
+    return {
+      ok: false,
+      error: 'offline-edition',
+      message: 'Run a newer Hermes offline installer to update this edition.'
+    }
+  }
 
   if (!bridge) {
     return { ok: false, error: 'unavailable', message: 'Desktop bridge unavailable.' }
@@ -643,6 +651,14 @@ let lastFocusAt = 0
 let connectionUnsub: (() => void) | null = null
 let lastConnectionMode: string | undefined
 
+async function checkAllUpdates(): Promise<void> {
+  const client = await checkUpdates()
+
+  if (!client?.offline) {
+    await checkBackendUpdates()
+  }
+}
+
 /** Wire up background polling + progress streaming. Idempotent. */
 export function startUpdatePoller(): void {
   if (pollerStarted || typeof window === 'undefined') {
@@ -656,8 +672,7 @@ export function startUpdatePoller(): void {
   }
 
   pollerStarted = true
-  void checkUpdates()
-  void checkBackendUpdates()
+  void checkAllUpdates()
   void refreshDesktopVersion()
   bridge.onProgress(ingestProgress)
 
@@ -679,8 +694,7 @@ export function startUpdatePoller(): void {
   window.addEventListener('focus', onFocus)
   backgroundTimer = setInterval(
     () => {
-      void checkUpdates()
-      void checkBackendUpdates()
+      void checkAllUpdates()
     },
     30 * 60 * 1000
   )
@@ -707,7 +721,6 @@ function onFocus() {
   }
 
   lastFocusAt = now
-  void checkUpdates()
-  void checkBackendUpdates()
+  void checkAllUpdates()
   void refreshDesktopVersion()
 }

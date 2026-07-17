@@ -7,8 +7,11 @@ for the full command timeout before surfacing a useless error.
 """
 
 import os
+import tempfile
 
 import pytest
+
+os.environ.setdefault("HERMES_HOME", os.path.join(tempfile.gettempdir(), "hermes-browser-tests"))
 
 from tools import browser_tool as bt
 
@@ -37,6 +40,30 @@ class TestChromiumSearchRoots:
         roots = bt._chromium_search_roots()
         home = os.path.expanduser("~")
         assert any(r == os.path.join(home, ".cache", "ms-playwright") for r in roots)
+
+    def test_includes_hermes_managed_playwright_cache(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.setattr(bt, "get_hermes_home", lambda: tmp_path)
+        managed = tmp_path / "playwright"
+
+        assert str(managed) in bt._chromium_search_roots()
+
+    def test_browser_env_uses_existing_hermes_managed_cache(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.setattr(bt, "get_hermes_home", lambda: tmp_path)
+        managed = tmp_path / "playwright"
+        managed.mkdir()
+
+        assert bt._build_browser_env()["PLAYWRIGHT_BROWSERS_PATH"] == str(managed)
+
+    def test_browser_env_points_agent_browser_at_managed_chrome(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
+        monkeypatch.setattr(bt, "get_hermes_home", lambda: tmp_path)
+        chrome = tmp_path / "playwright" / "chromium-1" / "chrome-win64" / "chrome.exe"
+        chrome.parent.mkdir(parents=True)
+        chrome.touch()
+
+        assert bt._build_browser_env()["AGENT_BROWSER_EXECUTABLE_PATH"] == str(chrome)
 
 
 class TestChromiumInstalled:
