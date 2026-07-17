@@ -52,7 +52,7 @@ export function UpdatesOverlay() {
   const backendChecking = useStore($backendUpdateChecking)
   const backendApply = useStore($backendUpdateApply)
 
-  const isBackend = target === 'backend'
+  const isBackend = target === 'backend' && !clientStatus?.offline
   const status = isBackend ? backendStatus : clientStatus
   const checking = isBackend ? backendChecking : clientChecking
   const apply = isBackend ? backendApply : clientApply
@@ -182,6 +182,10 @@ function IdleView({
         title={u.checkFailedTitle}
       />
     )
+  }
+
+  if (status.offline) {
+    return <CenteredStatus icon={<BrandMark className="size-12" />} title={status.version ?? ''} />
   }
 
   if (!status.supported) {

@@ -345,6 +345,25 @@ async fn run_bootstrap(
     args: StartBootstrapArgs,
     cancel_rx_holder: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
 ) -> Result<String> {
+    match crate::offline::discover_current_payload() {
+        Ok(Some(payload)) => {
+            return crate::offline::run_offline_bootstrap(app, args, cancel_rx_holder, payload)
+                .await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let message = format!("offline payload is invalid: {err:#}");
+            emit_event(
+                &app,
+                BootstrapEvent::Failed {
+                    stage: Some("verify".into()),
+                    error: message.clone(),
+                },
+            );
+            return Err(anyhow!(message));
+        }
+    }
+
     let kind = ScriptKind::for_current_os();
 
     let pin = Pin {
@@ -756,7 +775,7 @@ fn build_pin_args(script: &install_script::ResolvedScript) -> Vec<String> {
     out
 }
 
-fn emit_event(app: &AppHandle, event: BootstrapEvent) {
+pub(crate) fn emit_event(app: &AppHandle, event: BootstrapEvent) {
     // Tee important state transitions to the rolling installer log so
     // bootstrap-installer.log isn't just "starting" + final summary.
     // Log lines (the noisy stuff) handle their own tracing in
