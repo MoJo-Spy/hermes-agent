@@ -266,6 +266,9 @@ def _prepare_chromium(node: Path, target: Path) -> None:
 
 def _prepare_portable_git(target: Path) -> str:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "hermes-offline-builder"}
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     request = Request(
         "https://api.github.com/repos/git-for-windows/git/releases/latest",
         headers=headers,
@@ -438,6 +441,7 @@ def build_desktop_exe(output: Path, extras: list[str], repo: Path) -> None:
         build_bundle(payload, extras, repo)
         _remove_runtime_path(payload / "runtime", payload)
         (payload / MANIFEST).unlink()
+        shutil.copytree(repo / "skills", payload / "skills")
 
         desktop, bootstrap = _prepare_desktop_builds(repo)
         shutil.copytree(Path(sys.base_prefix), payload / "python")
@@ -563,6 +567,8 @@ def _load_desktop_bundle(bundle: Path) -> dict[str, Any]:
         raise RuntimeError(f"desktop payload is incomplete: {', '.join(missing)}")
     if not any(name.startswith("playwright/chromium") for name in actual):
         raise RuntimeError("desktop payload is incomplete: Chromium is missing")
+    if not any(name.startswith("skills/") and name.endswith("/SKILL.md") for name in actual):
+        raise RuntimeError("desktop payload is incomplete: bundled skills are missing")
     return manifest
 
 
@@ -592,7 +598,10 @@ def _stop_hermes_processes(home: Path) -> None:
 $root = [IO.Path]::GetFullPath($env:HERMES_INSTALLER_ARGUMENT).TrimEnd('\') + '\'
 $processes = Get-CimInstance Win32_Process -Filter "Name = 'Hermes.exe'" |
   Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }
-foreach ($process in $processes) {
+$processIds = @{}
+foreach ($process in $processes) { $processIds[[int]$process.ProcessId] = $true }
+$roots = $processes | Where-Object { -not $processIds.ContainsKey([int]$_.ParentProcessId) }
+foreach ($process in $roots) {
   & taskkill.exe /PID $process.ProcessId /T /F | Out-Null
   if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 128) { exit $LASTEXITCODE }
 }
@@ -734,6 +743,7 @@ def _provision_desktop_runtime(
         env=env,
         check=True,
     )
+    shutil.copytree(bundle / "skills", venv_root / "skills")
     shutil.copy2(node / "node.exe", venv_root / "Scripts" / "node.exe")
     license_path = node / "LICENSE"
     if license_path.is_file():
@@ -788,8 +798,22 @@ def _finish_desktop_install(home: Path, root: Path) -> None:
     ):
         (home / name).mkdir(exist_ok=True)
     (home / ".env").touch(exist_ok=True)
+    (root / "venv" / "Lib" / "site-packages" / ".install_method").write_text(
+        "offline\n", encoding="utf-8"
+    )
     desktop = root / "apps" / "desktop" / "release" / "win-unpacked"
     _create_shortcuts(desktop / "Hermes.exe")
+    sync_profiles = (
+        "from hermes_cli.profiles import list_profiles, seed_profile_skills; "
+        "failed = [p.name for p in list_profiles() "
+        "if seed_profile_skills(p.path, quiet=True) is None]; "
+        "assert not failed, f'failed to sync bundled skills: {failed}'"
+    )
+    subprocess.run(
+        [str(root / "venv" / "Scripts" / "python.exe"), "-c", sync_profiles],
+        env={**os.environ, "HERMES_HOME": str(home)},
+        check=True,
+    )
 
 
 def install_desktop_bundle(bundle: Path, home: Path) -> str:
@@ -963,7 +987,7 @@ def main() -> None:
         "desktop-exe", help="build a Windows x64 all-in-one offline Desktop EXE"
     )
     desktop.add_argument("output", type=Path)
-    desktop.add_argument("--extras", default="all")
+    desktop.add_argument("--extras", default="all,anthropic")
     install_desktop = commands.add_parser(
         "install-desktop", help="install an extracted offline Desktop payload"
     )
