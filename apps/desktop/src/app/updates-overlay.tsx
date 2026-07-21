@@ -4,7 +4,13 @@ import { useEffect, useState } from 'react'
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { writeClipboardText } from '@/components/ui/copy-button'
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  preventCloseButtonAutoFocus
+} from '@/components/ui/dialog'
 import { ErrorIcon, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import type { DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } from '@/global'
@@ -46,7 +52,7 @@ export function UpdatesOverlay() {
   const backendChecking = useStore($backendUpdateChecking)
   const backendApply = useStore($backendUpdateApply)
 
-  const isBackend = target === 'backend'
+  const isBackend = target === 'backend' && !clientStatus?.offline
   const status = isBackend ? backendStatus : clientStatus
   const checking = isBackend ? backendChecking : clientChecking
   const apply = isBackend ? backendApply : clientApply
@@ -94,7 +100,13 @@ export function UpdatesOverlay() {
 
   return (
     <Dialog onOpenChange={handleClose} open={open}>
-      <DialogContent className="max-w-sm overflow-hidden p-0 gap-0" showCloseButton={phase !== 'applying'}>
+      {/* This dialog has no inputs, so Radix's default autofocus would land on
+          the close button and trigger its tooltip immediately on open. */}
+      <DialogContent
+        className="max-w-sm overflow-hidden p-0 gap-0"
+        onOpenAutoFocus={preventCloseButtonAutoFocus}
+        showCloseButton={phase !== 'applying'}
+      >
         {phase === 'applying' && <ApplyingView apply={apply} isBackend={isBackend} />}
 
         {phase === 'manual' && (
@@ -170,6 +182,10 @@ function IdleView({
         title={u.checkFailedTitle}
       />
     )
+  }
+
+  if (status.offline) {
+    return <CenteredStatus icon={<BrandMark className="size-12" />} title={status.version ?? ''} />
   }
 
   if (!status.supported) {

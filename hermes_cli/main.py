@@ -65,6 +65,125 @@ import os
 import sys
 
 
+def _exit_after_oneshot(rc: object) -> None:
+    """Exit one-shot mode without letting late native finalizers change rc.
+
+    The SIGABRT this guards against (#30387, #43055) fires in a
+    native-extension finalizer during CPython's ``Py_FinalizeEx``, *after*
+    the response has printed. Flush streams, shut down file logging, then
+    ``os._exit`` past interpreter finalization. The ``atexit`` chain is
+    deliberately skipped — several handlers re-enter native code that may
+    be the abort source. Stateful cleanup is handled in ``_run_agent`` and
+    ``_cleanup_oneshot_runtime``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    if rc is None:
+        exit_code = 0
+    elif isinstance(rc, int):
+        exit_code = rc
+    else:
+        exit_code = 1
+    os._exit(exit_code)
+
+
+_oneshot_cleanup_done = False
+
+
+def _cleanup_oneshot_runtime() -> None:
+    """Best-effort process-global cleanup before one-shot hard exit.
+
+    ``run_oneshot`` owns the agent-local cleanup (memory provider, agent.close,
+    session_db.close — all in ``_run_agent``'s finally block). This mirrors the
+    process-global pieces from ``cli.py:_run_cleanup()`` that would otherwise
+    be skipped by ``os._exit``.
+    """
+    global _oneshot_cleanup_done
+    if _oneshot_cleanup_done:
+        return
+    _oneshot_cleanup_done = True
+    try:
+        from tools.terminal_tool import cleanup_all_environments
+        cleanup_all_environments()
+    except Exception:
+        pass
+    try:
+        from tools.async_delegation import interrupt_all
+        interrupt_all(reason="oneshot shutdown")
+    except Exception:
+        pass
+    try:
+        from tools.browser_tool import _emergency_cleanup_all_sessions
+        _emergency_cleanup_all_sessions()
+    except Exception:
+        pass
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
+    except BaseException:
+        pass
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+        shutdown_cached_clients()
+    except Exception:
+        pass
+
+
+def _run_and_exit_oneshot(
+    prompt: str,
+    *,
+    model: object = None,
+    provider: object = None,
+    toolsets: object = None,
+    usage_file: object = None,
+) -> None:
+    try:
+        from hermes_cli.oneshot import run_oneshot
+
+        rc = run_oneshot(
+            prompt,
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            usage_file=usage_file,
+        )
+    except KeyboardInterrupt:
+        rc = 130
+    except SystemExit as exc:
+        if exc.code is not None and not isinstance(exc.code, int):
+            print(exc.code, file=sys.stderr)
+            rc = 1
+        else:
+            rc = exc.code
+    except BaseException:
+        # Defense-in-depth. ``run_oneshot`` already converts agent failures
+        # into an int return code and only re-raises KeyboardInterrupt /
+        # SystemExit (handled above). Anything still escaping here means
+        # ``run_oneshot`` itself malfunctioned — surface it on stderr but never
+        # fall through to normal interpreter teardown, which is the exact path
+        # that aborts with SIGABRT on AL2023 (the bug this routine fixes).
+        import traceback
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+        rc = 1
+    try:
+        _cleanup_oneshot_runtime()
+    finally:
+        # The hard exit is the safety boundary for #43055. Even an interrupt
+        # during best-effort cleanup must not fall back into interpreter
+        # finalization, where the reported native SIGABRT occurs.
+        _exit_after_oneshot(rc)
+
+
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
     'htop' show the app name instead of 'python3.xx'.
@@ -272,6 +391,7 @@ if _try_termux_ultrafast_version():
 import argparse
 import hashlib
 import json
+import re
 import shlex
 import shutil
 import stat
@@ -1775,6 +1895,13 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         sys.exit(1)
 
     # 1. Prebuilt bundle (nix / packaged release): just run it.
+    #
+    # This must run BEFORE _ensure_tui_workspace() below. A pip/pipx install
+    # ships hermes_cli/tui_dist/entry.js in the wheel but never ships ui-tui/
+    # at all (that directory only exists in a git checkout) — so requiring
+    # the workspace to exist first made every pip/pipx dashboard Chat tab
+    # connection hard-exit before it ever got a chance to try the bundled
+    # entry.js it already has. See #56665.
     if not tui_dev:
         if ext_dir:
             p = Path(ext_dir)
@@ -1788,6 +1915,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             node = _node_bin("node")
             return [node, "--expose-gc", str(bundled)], bundled.parent
 
+    # No prebuilt bundle available (or --dev, which never uses one) — we're
+    # about to npm install/build from source, so the workspace must exist.
     if not ext_dir:
         _ensure_tui_workspace(tui_dir)
 
@@ -1830,6 +1959,12 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 npm,
                 "install",
                 *npm_workspace_args,
+                # --include=dev: ui-tui's build toolchain (esbuild, typescript)
+                # lives in devDependencies. An inherited NODE_ENV=production
+                # (e.g. from a container shell or a parent TUI launch) or an
+                # npm `omit=dev` config would silently skip them and the TUI
+                # build would fail. See _run_npm_install_deterministic.
+                "--include=dev",
                 "--silent",
                 "--no-fund",
                 "--no-audit",
@@ -2005,6 +2140,39 @@ def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
     return max(1536, sized) if limit_mb > 2048 else sized
 
 
+def _safe_tui_cwd(env: Optional[dict] = None) -> str:
+    """Return a stable cwd value for the Node TUI child environment."""
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        candidate = ((env or {}).get("PWD") or os.environ.get("PWD") or "").strip()
+        if candidate and Path(candidate).is_dir():
+            return candidate
+        return str(PROJECT_ROOT)
+
+
+def _apply_tui_python_env(env: dict) -> None:
+    """Seed/repair Python-related env vars shared by CLI and dashboard TUI launches."""
+    src_root = str(env.get("HERMES_PYTHON_SRC_ROOT") or "").strip()
+    if not src_root or not Path(src_root).is_dir():
+        env["HERMES_PYTHON_SRC_ROOT"] = str(PROJECT_ROOT)
+
+    cwd = str(env.get("HERMES_CWD") or "").strip()
+    if not cwd or not Path(cwd).is_dir():
+        env["HERMES_CWD"] = _safe_tui_cwd(env)
+
+    python = str(env.get("HERMES_PYTHON") or "").strip()
+    if os.path.dirname(python):
+        python_path = Path(python)
+        if not python_path.is_absolute():
+            python_path = Path(env["HERMES_CWD"]) / python_path
+        python_is_executable = python_path.is_file() and os.access(python_path, os.X_OK)
+    else:
+        python_is_executable = bool(shutil.which(python, path=env.get("PATH")))
+    if not python_is_executable:
+        env["HERMES_PYTHON"] = sys.executable
+
+
 def _launch_tui(
     resume_session_id: Optional[str] = None,
     tui_dev: bool = False,
@@ -2038,11 +2206,6 @@ def _launch_tui(
     )
     os.close(active_session_fd)
     env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
-    env["HERMES_PYTHON_SRC_ROOT"] = os.environ.get(
-        "HERMES_PYTHON_SRC_ROOT", str(PROJECT_ROOT)
-    )
-    env.setdefault("HERMES_PYTHON", sys.executable)
-    env.setdefault("HERMES_CWD", os.getcwd())
     env.setdefault("NODE_ENV", "development" if tui_dev else "production")
 
     wt_info = None
@@ -2066,6 +2229,8 @@ def _launch_tui(
             sys.exit(1)
         env["HERMES_CWD"] = wt_info["path"]
         env["TERMINAL_CWD"] = wt_info["path"]
+
+    _apply_tui_python_env(env)
 
     if model:
         env["HERMES_MODEL"] = model
@@ -3011,6 +3176,7 @@ def select_provider_and_model(args=None):
     from hermes_cli.models import (
         CANONICAL_PROVIDERS,
         _PROVIDER_LABELS,
+        _PROVIDER_ALIASES,
         group_providers,
         provider_group_for_slug,
     )
@@ -3034,7 +3200,30 @@ def select_provider_and_model(args=None):
     # resolves back to a concrete slug, so the dispatch chain below is
     # unchanged. Custom providers and the trailing actions stay flat.
     canonical_descs = {p.slug: p.tui_desc for p in CANONICAL_PROVIDERS}
-    grouped_rows = group_providers([p.slug for p in CANONICAL_PROVIDERS])
+    # Honor ``model_catalog.excluded_providers`` so the CLI ``hermes model``
+    # picker hides the same providers the gateway/TUI pickers do. A canonical
+    # provider is hidden if its slug OR any of its aliases appears in the
+    # exclusion list (case-insensitive), matching list_authenticated_providers'
+    # matching against hermes_id / alias / canonical slug.
+    _cli_excluded = {
+        str(p).strip().lower()
+        for p in (config.get("model_catalog", {}) or {}).get("excluded_providers") or []
+        if p
+    }
+    if _cli_excluded:
+        _alias_to_canon = _PROVIDER_ALIASES
+        _names_for: dict[str, set[str]] = {}
+        for _p in CANONICAL_PROVIDERS:
+            _names_for[_p.slug] = {_p.slug.lower()}
+        for _alias, _canon in _alias_to_canon.items():
+            _names_for.setdefault(_canon, {_canon.lower()}).add(_alias.lower())
+        _visible_slugs = [
+            p.slug for p in CANONICAL_PROVIDERS
+            if not _names_for.get(p.slug, {p.slug.lower()}) & _cli_excluded
+        ]
+    else:
+        _visible_slugs = [p.slug for p in CANONICAL_PROVIDERS]
+    grouped_rows = group_providers(_visible_slugs)
 
     # The group/slug that should be pre-selected: the active provider's group
     # if it's grouped, otherwise the active slug itself.
@@ -3259,6 +3448,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("approval", "Approval", "smart command approval"),
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
+    ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
     ("tts_audio_tags", "TTS audio tags", "Gemini TTS tag insertion"),
     ("skills_hub", "Skills hub", "skills search/install"),
     ("triage_specifier", "Triage specifier", "kanban spec fleshing"),
@@ -4840,6 +5030,25 @@ def _run_npm_install_deterministic(
     rewrites committed lockfiles (stripping ``"peer": true`` etc.), which leaves
     the working tree dirty and causes the next ``hermes update`` to stash the
     lockfile — repeatedly.
+
+    ``--include=dev`` is forced on every invocation: the callers are frontend
+    builds (web UI / TUI / desktop workspaces), and those builds need the dev
+    toolchain (``tsc``, ``vite``, ``electron-builder`` — all
+    ``devDependencies``).  If the caller's environment has
+    ``NODE_ENV=production`` (or npm config ``omit=dev``) — which leaks in from
+    a shell profile, a container image, or the bundled TUI launcher that sets
+    ``NODE_ENV=production`` on its subprocess env — npm silently omits
+    devDependencies (exit 0, no error), so the build toolchain never installs
+    and the subsequent build dies with ``tsc: command not found`` (exit 127).
+    The flag overrides both the env var and npm config, unlike scrubbing
+    ``NODE_ENV`` from the environment which only fixes the env-leak case.
+
+    ``--no-save`` on the ``npm install`` fallback keeps it true to this
+    function's contract: never mutate ``package-lock.json``.  Without it, an
+    out-of-sync lockfile gets rewritten by the fallback, which drifts the
+    committed lockfile and makes every future ``npm ci`` fail — a
+    self-reinforcing cycle where web devDeps never install and a stale dist
+    is served on every update (PR #65595).
     """
     # unicode-animations' postinstall animates to /dev/tty (bypasses
     # --silent/capture_output). It no-ops when CI is set — same as the TUI
@@ -4848,7 +5057,7 @@ def _run_npm_install_deterministic(
 
     lockfile = cwd / "package-lock.json"
     if lockfile.exists():
-        ci_cmd = [npm, "ci", *extra_args]
+        ci_cmd = [npm, "ci", "--include=dev", *extra_args]
         ci_result = subprocess.run(
             ci_cmd,
             cwd=cwd,
@@ -4863,7 +5072,7 @@ def _run_npm_install_deterministic(
             return ci_result
         # Fall through to `npm install` — lockfile may be out of sync on a
         # WIP fork/branch, or `npm ci` may not be available on very old npm.
-    install_cmd = [npm, "install", *extra_args]
+    install_cmd = [npm, "install", "--no-save", "--include=dev", *extra_args]
     return subprocess.run(
         install_cmd,
         cwd=cwd,
@@ -5715,7 +5924,14 @@ def cmd_gui(args: argparse.Namespace):
             print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
         else:
             print("→ Installing desktop workspace dependencies...")
-            nixos_env = _nixos_build_env()
+            # Put the Hermes-managed Node on PATH so npm's child scripts (which
+            # shell out to bare `node`, e.g. electron-winstaller's
+            # select-7z-arch.js) resolve it even when the parent PATH is
+            # stripped — the desktop updater chain (Desktop → hermes-setup →
+            # hermes update) loses shell PATH customizations. Wrapping the
+            # NixOS build env keeps its PYTHON hint while restoring managed Node
+            # ahead of a bare PATH (same idiom as the `hermes update` path).
+            nixos_env = with_hermes_node_path(_nixos_build_env())
             install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
             if install_result.returncode != 0:
                 if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
@@ -8891,23 +9107,30 @@ def _ensure_fhs_path_guard() -> None:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
 
 
-def _run_pre_update_backup(args) -> None:
-    """Create a full zip backup of HERMES_HOME before running the update.
+_PRE_UPDATE_SNAPSHOT_KEEP = 1
 
-    Gated on ``updates.pre_update_backup`` in config (default false).  Off
-    by default because the zip can add minutes to every update on large
-    HERMES_HOME directories.  The ``--backup`` flag on ``hermes update``
-    opts in for a single run; ``--no-backup`` forces it off when config
-    has it enabled.  Never raises — a backup failure should not block the
-    update itself.
+# Per-file size cap for the pre-update quick snapshot. Anything larger is
+# skipped with a warning: the snapshot exists to protect small, hard-to-
+# regenerate state (pairing JSONs, cron jobs, config, auth) — not to copy a
+# multi-GB state.db on every update (observed: a 24 GB state.db added ~60s
+# of wall time and silently ate 24 GB of disk per update).
+_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE = 1 << 30  # 1 GiB
+
+
+def _resolve_pre_update_backup_mode(args) -> str:
+    """Resolve the pre-update backup mode: ``"off"``, ``"quick"``, or ``"full"``.
+
+    CLI flags win over config; ``--no-backup`` beats ``--backup`` when both
+    are set. Config accepts the mode strings plus legacy booleans:
+    ``true`` → ``full`` (the old zip behavior), ``false`` → ``off``
+    (an explicit opt-out now disables the quick snapshot too — previously
+    it ran unconditionally, ignoring the user's setting). A missing key
+    defaults to ``quick``.
     """
-    # CLI flags win over config.  --no-backup beats --backup if both are set.
     if getattr(args, "no_backup", False):
-        print("◆ Pre-update backup: skipped (--no-backup)")
-        print()
-        return
-
-    force_backup = bool(getattr(args, "backup", False))
+        return "off"
+    if getattr(args, "backup", False):
+        return "full"
 
     try:
         from hermes_cli.config import load_config
@@ -8920,19 +9143,76 @@ def _run_pre_update_backup(args) -> None:
         cfg = {}
 
     updates_cfg = cfg.get("updates", {}) if isinstance(cfg, dict) else {}
-    # The default config ships with ``pre_update_backup: false`` (see
-    # ``hermes_cli/config.py``). Fall back to false if the key is missing
-    # so the default behaviour matches the shipped config: zipping a large
-    # HERMES_HOME can add minutes to every update. Users who want the
-    # #48200 safety net opt in via the config knob or ``--backup``.
-    enabled = updates_cfg.get("pre_update_backup", False)
-    keep = updates_cfg.get("backup_keep", 5)
+    raw = updates_cfg.get("pre_update_backup", "quick")
 
-    if not enabled and not force_backup:
-        # Silent by default — the backup is off, most users don't need to
-        # hear about it on every update.  They can opt in via --backup
-        # or by flipping the config knob.
-        return
+    if raw is True:
+        return "full"
+    if raw is False:
+        return "off"
+    mode = str(raw).strip().lower()
+    if mode in ("off", "false", "none", "disabled"):
+        return "off"
+    if mode in ("full", "zip", "true"):
+        return "full"
+    if mode == "quick":
+        return "quick"
+    logging.getLogger(__name__).warning(
+        "Unknown updates.pre_update_backup value %r — using 'quick'", raw
+    )
+    return "quick"
+
+
+def _run_pre_update_backup(args) -> Optional[str]:
+    """Run the pre-update safety backup and return the quick-snapshot id.
+
+    Single consolidated mechanism gated on ``updates.pre_update_backup``:
+
+    - ``off``   — nothing runs. Explicit user opt-out is honored fully.
+    - ``quick`` (default) — a state snapshot of critical small files
+      (pairing JSONs, cron jobs, config, auth; see ``_QUICK_STATE_FILES``)
+      under ``state-snapshots/``. Files over 1 GiB are skipped with a
+      warning so a bloated state.db can never stall the update
+      (issues #15733, #34600 are the reason this safety net exists).
+    - ``full``  — the quick snapshot PLUS a full zip of HERMES_HOME under
+      ``backups/`` (restorable via ``hermes import``; the #48200 wrong-path
+      wipe is the reason this level exists).
+
+    ``--backup`` forces ``full`` for one run; ``--no-backup`` forces ``off``.
+    Never raises — a backup failure should not block the update itself.
+
+    Returns the quick-snapshot id (used by the post-update cron-jobs
+    restore safety net), or ``None`` when mode is ``off`` or the snapshot
+    failed.
+    """
+    mode = _resolve_pre_update_backup_mode(args)
+
+    if mode == "off":
+        if getattr(args, "no_backup", False):
+            print("◆ Pre-update backup: skipped (--no-backup)")
+            print()
+        # Config-level off is silent — the user opted out; don't spam them
+        # on every update.
+        return None
+
+    snapshot_id = None
+    try:
+        from hermes_cli.backup import create_quick_snapshot
+
+        snapshot_id = create_quick_snapshot(
+            label="pre-update",
+            keep=_PRE_UPDATE_SNAPSHOT_KEEP,
+            max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+        )
+        if snapshot_id:
+            print(f"◆ Pre-update snapshot: {snapshot_id}")
+    except Exception as exc:
+        # Never let a snapshot failure block an update.
+        logging.getLogger(__name__).debug("Pre-update snapshot failed: %s", exc)
+
+    if mode != "full":
+        if snapshot_id:
+            print()
+        return snapshot_id
 
     try:
         from hermes_cli.backup import create_pre_update_backup
@@ -8941,24 +9221,31 @@ def _run_pre_update_backup(args) -> None:
             f"⚠ Pre-update backup: could not load backup module ({exc}); continuing update."
         )
         print()
-        return
+        return snapshot_id
+
+    try:
+        from hermes_cli.config import load_config
+
+        _keep = (load_config() or {}).get("updates", {}).get("backup_keep", 5)
+    except Exception:
+        _keep = 5
 
     print("◆ Creating pre-update backup...")
     t0 = _time.monotonic()
     try:
-        out_path = create_pre_update_backup(keep=int(keep))
+        out_path = create_pre_update_backup(keep=int(_keep))
     except Exception as exc:  # defensive — helper already swallows, but just in case
         print(f"  ⚠ Backup failed: {exc}")
         print("  Continuing with update.")
         print()
-        return
+        return snapshot_id
 
     elapsed = _time.monotonic() - t0
 
     if out_path is None:
         print("  ⚠ Backup skipped (no files found or write failed); continuing update.")
         print()
-        return
+        return snapshot_id
 
     try:
         size_bytes = out_path.stat().st_size
@@ -8987,9 +9274,9 @@ def _run_pre_update_backup(args) -> None:
 
     print(f"  Saved:    {display_path} ({size_str}, {elapsed:.1f}s)")
     print(f"  Restore:  hermes import {out_path}")
-    print("  Disable:  omit --backup (backups are off by default)")
-    print("            set updates.pre_update_backup: false in config.yaml")
+    print("  Disable:  set updates.pre_update_backup: quick (or off) in config.yaml")
     print()
+    return snapshot_id
 
 
 def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
@@ -9694,7 +9981,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
-    _run_pre_update_backup(args)
+    # Returns the quick-snapshot id (or None when disabled/failed); the
+    # post-update cron-jobs safety net uses it to detect job loss.
+    pre_update_snapshot_id = _run_pre_update_backup(args)
 
     _windows_gateway_resume = _pause_windows_gateways_for_update()
     if _windows_gateway_resume:
@@ -9979,23 +10268,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print(f"→ Found {commit_count} new commit(s)")
 
-        # Snapshot critical state (state.db, config, pairing JSONs, etc.)
-        # before pulling so a user can recover if something goes wrong.
-        # Issue #15733 reported missing pairing data after an update; even
-        # though `git pull` can't touch $HERMES_HOME, this is cheap
-        # belt-and-suspenders insurance and gives the user something to
-        # restore from via `/snapshot list` / `/snapshot restore <id>`.
-        pre_update_snapshot_id = None
-        try:
-            from hermes_cli.backup import create_quick_snapshot
-
-            pre_update_snapshot_id = create_quick_snapshot(label="pre-update", keep=1)
-            if pre_update_snapshot_id:
-                print(f"  ✓ Pre-update snapshot: {pre_update_snapshot_id}")
-        except Exception as exc:
-            # Never let a snapshot failure block an update.
-            logger.debug("Pre-update snapshot failed: %s", exc)
-
         print("→ Pulling updates...")
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
@@ -10209,9 +10481,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # covers a still-settling rebuild window the first wait didn't fully
             # catch — then surface the captured tail so the failure is
             # debuggable.
-            build_result = _run_logged_subprocess(_desktop_build_cmd, cwd=PROJECT_ROOT)
+            #
+            # Start the build subprocess with the Hermes-managed Node on PATH:
+            # when `hermes update` runs inside the desktop updater chain
+            # (Desktop → hermes-setup → hermes update), the shell PATH
+            # customizations are lost, so a bare-PATH child would fail with
+            # `node: not found` before cmd_gui can self-heal.
+            from hermes_constants import with_hermes_node_path
+
+            _build_env = with_hermes_node_path()
+            build_result = _run_logged_subprocess(_desktop_build_cmd, cwd=PROJECT_ROOT, env=_build_env)
             if build_result.returncode != 0:
-                build_result = _run_logged_subprocess(_desktop_build_cmd, cwd=PROJECT_ROOT)
+                build_result = _run_logged_subprocess(_desktop_build_cmd, cwd=PROJECT_ROOT, env=_build_env)
             if build_result.returncode != 0:
                 print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
                 tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
@@ -12185,6 +12466,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     try:
         from hermes_cli.config import load_config, save_config
+        from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
 
         cfg = load_config()
         dash = cfg.setdefault("dashboard", {})
@@ -12195,6 +12477,16 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
         basic["password"] = ""
         if not str(basic.get("secret", "") or "").strip():
             basic["secret"] = secret
+        # The bundled basic provider is a backend plugin that still honours
+        # plugins.disabled. Unblock it when we just wrote basic_auth so the
+        # discover_plugins(force=True) call below can register the provider
+        # (#54489). Surface the mutation so an operator who deliberately
+        # disabled it isn't surprised.
+        if ensure_basic_auth_plugin_enabled_in_config(cfg):
+            print(
+                "  ✓ Re-enabled the bundled 'basic' auth plugin "
+                "(was in plugins.disabled)"
+            )
         save_config(cfg)
     except Exception as exc:
         print(f"  ✗ Failed to write config.yaml: {exc}")
@@ -12217,8 +12509,97 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
 
 
+def _read_ssh_session_token_file(path: str) -> str:
+    """Read and unlink a Desktop SSH token from its private runtime directory."""
+    if sys.platform == "win32":
+        from hermes_cli.windows_ssh_runtime import read_token
+        return read_token(path)
+
+    import stat as _stat
+    from pathlib import Path as _Path
+    from hermes_constants import get_hermes_home as _get_hermes_home
+
+    if not os.path.isabs(path):
+        raise SystemExit("--ssh-session-token-file must be absolute")
+
+    token_path = _Path(path)
+    token_root = _get_hermes_home() / "desktop-ssh"
+    try:
+        relative = token_path.relative_to(token_root)
+    except ValueError as exc:
+        raise SystemExit("--ssh-session-token-file must be under the desktop-ssh directory") from exc
+    if len(relative.parts) != 2 or not re.fullmatch(r"[0-9a-f]{32}", relative.parts[0]):
+        raise SystemExit("--ssh-session-token-file has an invalid runtime path")
+    if not re.fullmatch(r"[0-9a-f]{16}\.token", relative.parts[1]):
+        raise SystemExit("--ssh-session-token-file has an invalid filename")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = -1
+    directory_fd = -1
+    file_fd = -1
+    try:
+        try:
+            root_fd = os.open(token_root, directory_flags)
+            root_stat = os.fstat(root_fd)
+            if not _stat.S_ISDIR(root_stat.st_mode):
+                raise SystemExit("--ssh-session-token-file has an unsafe runtime root")
+            if hasattr(os, "getuid") and root_stat.st_uid != os.getuid():
+                raise SystemExit("--ssh-session-token-file runtime root has the wrong owner")
+            directory_fd = os.open(relative.parts[0], directory_flags, dir_fd=root_fd)
+            directory_stat = os.fstat(directory_fd)
+            if not _stat.S_ISDIR(directory_stat.st_mode):
+                raise SystemExit("--ssh-session-token-file has an unsafe parent directory")
+            if hasattr(os, "getuid") and directory_stat.st_uid != os.getuid():
+                raise SystemExit("--ssh-session-token-file parent has the wrong owner")
+            if (directory_stat.st_mode & 0o777) != 0o700:
+                raise SystemExit("--ssh-session-token-file parent has unsafe permissions")
+            file_fd = os.open(relative.parts[1], file_flags, dir_fd=directory_fd)
+        except SystemExit:
+            raise
+        except OSError as exc:
+            if exc.errno == getattr(__import__("errno"), "ELOOP", -1):
+                raise SystemExit("--ssh-session-token-file is a symlink") from exc
+            raise SystemExit("--ssh-session-token-file is not accessible") from exc
+
+        file_stat = os.fstat(file_fd)
+        if not _stat.S_ISREG(file_stat.st_mode):
+            raise SystemExit("--ssh-session-token-file is not a regular file")
+        if file_stat.st_size != 64:
+            raise SystemExit("--ssh-session-token-file contains an invalid token")
+        if hasattr(os, "getuid") and file_stat.st_uid != os.getuid():
+            raise SystemExit("--ssh-session-token-file has the wrong owner")
+        if hasattr(os, "getuid") and (file_stat.st_mode & 0o777) & ~0o600:
+            raise SystemExit("--ssh-session-token-file has unsafe permissions")
+
+        with os.fdopen(file_fd, "r") as token_stream:
+            file_fd = -1
+            token = token_stream.read(65)
+
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise SystemExit("--ssh-session-token-file contains an invalid token")
+        return token
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            try:
+                os.unlink(relative.parts[1], dir_fd=directory_fd)
+            except OSError:
+                pass
+            os.close(directory_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
+    _token_file = getattr(args, "ssh_session_token_file", None)
+    if _token_file and (
+        getattr(args, "status", False) or getattr(args, "stop", False)
+    ):
+        raise SystemExit("--ssh-session-token-file cannot be used with --status or --stop")
+
     # --status: report running dashboards and exit, no deps needed.
     if getattr(args, "status", False):
         count = _report_dashboard_status()
@@ -12241,6 +12622,12 @@ def cmd_dashboard(args):
     # ready sentinel. Resolved once and threaded through the re-exec, the
     # build gate, and start_server.
     _headless_backend = getattr(args, "headless_backend", False)
+    _ssh_owner_nonce = getattr(args, "ssh_owner_nonce", None)
+    if _ssh_owner_nonce and not re.fullmatch(r"[0-9a-f]{16}", _ssh_owner_nonce):
+        raise SystemExit("--ssh-owner-nonce must be 16 lowercase hex characters")
+    _ssh_session_token = None
+    if _token_file and not _headless_backend:
+        raise SystemExit("--ssh-session-token-file is only valid with hermes serve")
 
     # ── Unified profile launch routing ────────────────────────────────
     # The dashboard is a MACHINE management surface: it can read/write any
@@ -12294,6 +12681,10 @@ def cmd_dashboard(args):
             "--host", args.host,
             "--open-profile", _launch_profile,
         ]
+        if _ssh_owner_nonce:
+            reexec_argv.extend(["--ssh-owner-nonce", _ssh_owner_nonce])
+        if _token_file:
+            reexec_argv.extend(["--ssh-session-token-file", _token_file])
         if args.no_open:
             reexec_argv.append("--no-open")
         if getattr(args, "insecure", False):
@@ -12330,6 +12721,9 @@ def cmd_dashboard(args):
         else:
             os.execvpe(sys.executable, reexec_argv, env)
 
+    if _token_file:
+        _ssh_session_token = _read_ssh_session_token_file(_token_file)
+
     # Attach gui.log early so dashboard startup/build failures are captured in
     # the same logs directory as every other Hermes surface.
     try:
@@ -12357,6 +12751,23 @@ def cmd_dashboard(args):
     # cmd_chat does this in its own pre-dispatch block; the dashboard
     # backend is the desktop's primary entrypoint and needs the same.
     _sync_bundled_skills_quietly()
+
+    # Bridge terminal.* config into the TERMINAL_* env vars for THIS process,
+    # mirroring the CLI (cli.py env_mappings) and gateway (gateway/run.py
+    # _terminal_env_map) startup bridges. The dashboard/serve backend runs
+    # agents in-process (tui_gateway.ws → server._make_agent) and ticks cron
+    # jobs itself when desktop-spawned — without this bridge those consumers
+    # saw an unset TERMINAL_ENV and silently ran every command on the host
+    # even when config.yaml selects `terminal.backend: docker`
+    # (#63141, #54449, #61115, #65696). PTY chat spawns already bridge their
+    # child env copy; this covers the in-process consumers.
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        apply_terminal_config_to_env()
+    except Exception:
+        logger.debug("terminal config → env bridge failed for dashboard/serve",
+                     exc_info=True)
 
     if _headless_backend:
         # Don't build the SPA, and tell mount_spa() (read at web_server import
@@ -12453,6 +12864,8 @@ def cmd_dashboard(args):
         allow_public=getattr(args, "insecure", False),
         initial_profile=getattr(args, "open_profile", "") or "",
         headless=_headless_backend,
+        ssh_session_token=_ssh_session_token,
+        ssh_owner_nonce=_ssh_owner_nonce,
     )
 
 
@@ -12816,16 +13229,12 @@ def _try_termux_fast_cli_launch() -> bool:
 
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
-        from hermes_cli.oneshot import run_oneshot
-
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-                usage_file=getattr(args, "usage_file", None),
-            )
+        _run_and_exit_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            usage_file=getattr(args, "usage_file", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -14973,16 +15382,12 @@ def main():
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
     if getattr(args, "oneshot", None):
-        from hermes_cli.oneshot import run_oneshot
-
-        sys.exit(
-            run_oneshot(
-                args.oneshot,
-                model=getattr(args, "model", None),
-                provider=getattr(args, "provider", None),
-                toolsets=getattr(args, "toolsets", None),
-                usage_file=getattr(args, "usage_file", None),
-            )
+        _run_and_exit_oneshot(
+            args.oneshot,
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+            toolsets=getattr(args, "toolsets", None),
+            usage_file=getattr(args, "usage_file", None),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

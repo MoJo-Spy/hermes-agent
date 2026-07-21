@@ -1605,6 +1605,12 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # not by the user explicitly configuring anthropic in Hermes.
     _IMPLICIT_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"}
     pconfig = PROVIDER_REGISTRY.get(normalized)
+    # Fallback to ProviderDef from models.dev catalog when the provider
+    # isn't in the manually-maintained PROVIDER_REGISTRY (e.g. openrouter).
+    # Both expose .auth_type and .api_key_env_vars with the same shape.
+    if pconfig is None:
+        from hermes_cli.providers import get_provider
+        pconfig = get_provider(normalized)
     if pconfig and pconfig.auth_type == "api_key":
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
@@ -8148,7 +8154,7 @@ def step_up_nous_billing_scope(
     The lazy step-up (plan D-A): triggered when a billing endpoint returns
     ``403 insufficient_scope``. Runs a fresh device-connect with
     ``inference:invoke tool:invoke billing:manage`` on the scope. The user must be
-    an ADMIN/OWNER and tick "Allow terminal billing" in the portal for the minted
+    an ADMIN/OWNER and select "Allow Remote Spending" in the portal for the minted
     token to actually carry the scope; otherwise the server silently downscopes and this
     returns False.
 

@@ -43,6 +43,7 @@ vi.mock('@/hermes', () => ({
 
 const {
   maybeNotifyUpdateAvailable,
+  checkUpdates,
   checkBackendUpdates,
   $backendUpdateStatus,
   applyBackendUpdate,
@@ -120,7 +121,7 @@ describe('reportBackendContract', () => {
   })
 
   it('dismisses the toast when the backend meets the contract', () => {
-    reportBackendContract(3)
+    reportBackendContract(4)
     expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew')
     expect(notifySpy).not.toHaveBeenCalled()
   })
@@ -160,8 +161,8 @@ describe('reportBackendContract', () => {
     lastToast().onDismiss()
     notifySpy.mockClear()
 
-    reportBackendContract(3) // backend updated → satisfied, snooze cleared
-    reportBackendContract(2) // a later regression must warn immediately
+    reportBackendContract(4) // backend updated → satisfied, snooze cleared
+    reportBackendContract(3) // a later regression must warn immediately
     expect(notifySpy).toHaveBeenCalledTimes(1)
   })
 })
@@ -172,6 +173,7 @@ describe('checkBackendUpdates', () => {
     notifySpy.mockClear()
     checkHermesUpdateSpy.mockReset()
     $backendUpdateStatus.set(null)
+    $updateStatus.set(null)
     vi.useRealTimers()
   })
 
@@ -252,6 +254,35 @@ describe('checkBackendUpdates', () => {
     await checkBackendUpdates()
     expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
   })
+
+  it('does not check a remote backend for an offline edition', async () => {
+    setRemote(true)
+    $updateStatus.set({ supported: false, offline: true, version: '1.2.3' })
+
+    await checkBackendUpdates()
+
+    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('checkUpdates offline edition', () => {
+  afterEach(() => {
+    delete (globalThis as unknown as { window?: unknown }).window
+    $updateStatus.set(null)
+  })
+
+  it('publishes the local offline status without an update notification', async () => {
+    const offline = { supported: false, offline: true, version: '1.2.3' }
+    const check = vi.fn().mockResolvedValue(offline)
+    ;(globalThis as unknown as { window: unknown }).window = {
+      hermesDesktop: { updates: { check } }
+    }
+    notifySpy.mockClear()
+
+    expect(await checkUpdates()).toEqual(offline)
+    expect($updateStatus.get()).toEqual(offline)
+    expect(notifySpy).not.toHaveBeenCalled()
+  })
 })
 
 describe('applyUpdates terminal state', () => {
@@ -263,6 +294,7 @@ describe('applyUpdates terminal state', () => {
     dismissSpy.mockClear()
     applyMock.mockReset()
     resetUpdateApplyState()
+    $updateStatus.set(null)
     $updateOverlayOpen.set(true)
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { apply: applyMock } }
@@ -272,6 +304,19 @@ describe('applyUpdates terminal state', () => {
 
   afterEach(() => {
     delete (globalThis as unknown as { window?: unknown }).window
+  })
+
+  it('does not invoke the update bridge for an offline edition', async () => {
+    const apply = vi.fn()
+    ;(globalThis as unknown as { window: unknown }).window = {
+      hermesDesktop: { updates: { apply } }
+    }
+    $updateStatus.set({ supported: false, offline: true, version: '1.2.3' })
+
+    const result = await applyUpdates()
+
+    expect(result.error).toBe('offline-edition')
+    expect(apply).not.toHaveBeenCalled()
   })
 
   it('holds the restart view when a relauncher hands off (no close, no toast)', async () => {
