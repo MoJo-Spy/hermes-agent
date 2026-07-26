@@ -314,6 +314,9 @@ def _prepare_desktop_builds(repo: Path) -> tuple[Path, Path]:
         subprocess.run(
             [npm, "install", "--no-audit", "--no-fund"], cwd=repo, check=True
         )
+        # npm can rewrite the lockfile without changing dependencies. Restore it
+        # before packaging so the embedded build stamp describes committed source.
+        lock_path.write_bytes(lock_content)
         subprocess.run(
             [npm, "run", "pack", "--workspace", "apps/desktop"],
             cwd=repo,

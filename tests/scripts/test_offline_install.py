@@ -138,6 +138,41 @@ def test_prepare_chromium_reuses_a_complete_official_cache(tmp_path, monkeypatch
     assert (tmp_path / "playwright" / "chromium-1.2.3" / "chrome.exe").is_file()
 
 
+def test_prepare_desktop_builds_restores_lockfile_before_pack(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    lock_path = repo / "package-lock.json"
+    lock_path.parent.mkdir()
+    lock_path.write_bytes(b"committed lockfile")
+    desktop = repo / "apps" / "desktop" / "release" / "win-unpacked" / "Hermes.exe"
+    bootstrap = (
+        repo
+        / "apps"
+        / "bootstrap-installer"
+        / "src-tauri"
+        / "target"
+        / "release"
+        / "Hermes-Setup.exe"
+    )
+    desktop.parent.mkdir(parents=True)
+    bootstrap.parent.mkdir(parents=True)
+    desktop.touch()
+    bootstrap.touch()
+    lockfiles_seen_by_pack = []
+
+    def fake_run(command, **_kwargs):
+        if command[1] == "install":
+            lock_path.write_bytes(b"transient npm rewrite")
+        else:
+            lockfiles_seen_by_pack.append(lock_path.read_bytes())
+
+    monkeypatch.setattr(offline_install.shutil, "which", lambda _name: "npm")
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+
+    assert offline_install._prepare_desktop_builds(repo) == (desktop.parent, bootstrap)
+    assert lockfiles_seen_by_pack == [b"committed lockfile", b"committed lockfile"]
+    assert lock_path.read_bytes() == b"committed lockfile"
+
+
 def test_node_license_downloads_exact_version_when_not_installed(tmp_path, monkeypatch):
     requested = {}
 
