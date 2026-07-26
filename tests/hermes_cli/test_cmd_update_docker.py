@@ -89,6 +89,40 @@ def test_cmd_update_in_docker_ignores_yes_and_force(
 
 
 @patch("hermes_cli.config.is_managed", return_value=False)
+@patch("hermes_cli.config.detect_install_method", return_value="offline")
+@patch("subprocess.run")
+def test_cmd_update_in_offline_edition_prints_guidance_and_exits(
+    mock_run, _mock_method, _mock_managed, capsys
+):
+    """Offline editions must never enter the local git/self-update path."""
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_update(SimpleNamespace(check=False))
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().out.strip() == (
+        "Run a newer Hermes offline installer to update this edition."
+    )
+    mock_run.assert_not_called()
+
+
+@patch("hermes_cli.config.is_managed", return_value=False)
+@patch("hermes_cli.config.detect_install_method", return_value="offline")
+@patch("subprocess.run")
+def test_cmd_update_check_in_offline_edition_prints_guidance_and_exits(
+    mock_run, _mock_method, _mock_managed, capsys
+):
+    """``hermes update --check`` must not fetch from an offline edition."""
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_update(SimpleNamespace(check=True, branch=None))
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().out.strip() == (
+        "Run a newer Hermes offline installer to update this edition."
+    )
+    mock_run.assert_not_called()
+
+
+@patch("hermes_cli.config.is_managed", return_value=False)
 @patch("hermes_cli.config.detect_install_method", return_value="nix")
 @patch("hermes_cli.main._cmd_update_impl")
 def test_cmd_update_on_nix_install_prints_guidance_without_running_local_updater(
@@ -131,6 +165,22 @@ def test_cmd_update_check_direct_on_nix_install_prints_guidance_and_exits(
     assert excinfo.value.code == 1
     assert "Nix" in capsys.readouterr().out
     assert mock_run.call_args_list == []
+
+
+@patch("hermes_cli.config.detect_install_method", return_value="offline")
+@patch("subprocess.run")
+def test_cmd_update_check_direct_in_offline_edition_exits_without_fetch(
+    mock_run, _mock_method, capsys
+):
+    """The direct check helper must not bypass the offline guard."""
+    with pytest.raises(SystemExit) as excinfo:
+        _cmd_update_check()
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().out.strip() == (
+        "Run a newer Hermes offline installer to update this edition."
+    )
+    mock_run.assert_not_called()
 
 
 # ---------- Non-Docker installs unaffected ----------

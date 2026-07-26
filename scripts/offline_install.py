@@ -147,6 +147,7 @@ def build_bundle(output: Path, extras: list[str], repo: Path) -> None:
                 _spec(".", extras),
             ],
             cwd=repo,
+            env={**os.environ, "HERMES_OFFLINE_BUILD": "1"},
             check=True,
         )
     wheel_paths = sorted(wheels.glob("*.whl"))
@@ -247,21 +248,25 @@ def _prepare_portable_node(target: Path, repo: Path) -> tuple[str, str]:
 
 
 def _prepare_chromium(node: Path, target: Path) -> None:
-    subprocess.run(
-        ["cmd.exe", "/d", "/c", str(node / "agent-browser.cmd"), "install"],
-        check=True,
-    )
     browser_cache = Path.home() / ".agent-browser" / "browsers"
-    candidates = sorted(browser_cache.glob("chrome-*"), reverse=True)
-    source = next(
-        (path for path in candidates if any(path.rglob("chrome.exe"))), None
-    )
+    source = _find_cached_chromium(browser_cache)
+    if source is None:
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", str(node / "agent-browser.cmd"), "install"],
+            check=True,
+        )
+        source = _find_cached_chromium(browser_cache)
     if source is None:
         raise RuntimeError("agent-browser did not download Chrome for Testing")
     target.mkdir()
     shutil.copytree(
         source, target / source.name.replace("chrome-", "chromium-", 1)
     )
+
+
+def _find_cached_chromium(browser_cache: Path) -> Path | None:
+    candidates = sorted(browser_cache.glob("chrome-*"), reverse=True)
+    return next((path for path in candidates if any(path.rglob("chrome.exe"))), None)
 
 
 def _prepare_portable_git(target: Path) -> str:
@@ -679,7 +684,10 @@ def _validate_desktop_runtime(
         [
             str(python),
             "-c",
-            "from hermes_cli.main import _find_bundled_tui; assert _find_bundled_tui()",
+            "from hermes_cli.main import _find_bundled_tui; "
+            "from tools.skills_sync import _get_bundled_dir; "
+            "assert _find_bundled_tui(); "
+            "assert any(_get_bundled_dir().rglob('SKILL.md'))",
         ],
         env=env,
         check=True,
@@ -743,7 +751,12 @@ def _provision_desktop_runtime(
         env=env,
         check=True,
     )
-    shutil.copytree(bundle / "skills", venv_root / "skills")
+    # ``tools.skills_sync`` resolves bundled skills beside Python packages.
+    # Keep the payload tree there rather than beside the virtual environment,
+    # where a wheel install cannot discover it.
+    shutil.copytree(
+        bundle / "skills", venv_root / "Lib" / "site-packages" / "skills"
+    )
     shutil.copy2(node / "node.exe", venv_root / "Scripts" / "node.exe")
     license_path = node / "LICENSE"
     if license_path.is_file():

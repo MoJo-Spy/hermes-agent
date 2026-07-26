@@ -1092,6 +1092,27 @@ class TestUpdateCheckEndpoint:
         assert body["message"]
         assert body["behind"] is None
 
+    def test_offline_is_not_applyable_or_checked_over_network(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "offline")
+        monkeypatch.setattr(
+            banner,
+            "check_for_updates",
+            lambda: pytest.fail("offline update check must not call the network checker"),
+        )
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["install_method"] == "offline"
+        assert body["can_apply"] is False
+        assert body["behind"] is None
+        assert body["update_available"] is False
+        assert body["message"] == "Run a newer Hermes offline installer to update this edition."
+        assert body["update_command"] == body["message"]
+
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
         import hermes_cli.web_server as ws
 

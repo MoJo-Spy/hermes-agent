@@ -10136,8 +10136,16 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     Installs that can't honor non-default branches (e.g. Docker) surface a
     one-line notice instead of silently dropping the flag.
     """
-    from hermes_cli.config import detect_install_method, recommended_update_command_for_method
+    from hermes_cli.config import (
+        detect_install_method,
+        format_offline_update_message,
+        recommended_update_command_for_method,
+    )
     method = detect_install_method(PROJECT_ROOT)
+    if method == "offline":
+        print(format_offline_update_message())
+        sys.exit(1)
+
     if method == "docker":
         # Docker can't ``git fetch`` from within the container.  Surface the
         # same long-form ``docker pull`` guidance ``hermes update`` (apply
@@ -11201,6 +11209,7 @@ def cmd_update(args):
     from hermes_cli.config import (
         detect_install_method,
         format_docker_update_message,
+        format_offline_update_message,
         is_managed,
         managed_error,
         recommended_update_command_for_method,
@@ -11217,6 +11226,10 @@ def cmd_update(args):
     # repository" text.  See format_docker_update_message() for the full
     # rationale and tag-pinning / config-persistence notes.
     install_method = detect_install_method(PROJECT_ROOT)
+    if install_method == "offline":
+        print(format_offline_update_message())
+        sys.exit(1)
+
     if install_method == "docker":
         print(format_docker_update_message())
         sys.exit(1)

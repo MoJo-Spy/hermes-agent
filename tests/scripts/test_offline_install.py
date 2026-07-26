@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -36,6 +37,105 @@ def test_windows_powershell_paths_are_passed_through_environment(monkeypatch):
     stop_script = calls[0][0][-1]
     assert "ParentProcessId" in stop_script
     assert "foreach ($process in $roots)" in stop_script
+
+
+def test_build_bundle_marks_its_private_wheel_subprocess_offline(tmp_path, monkeypatch):
+    node = tmp_path / "node.exe"
+    node.write_bytes(b"node")
+    calls = []
+
+    class FakeVenvBuilder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create(self, target):
+            Path(target).mkdir(parents=True)
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        wheel_dir = Path(command[command.index("--wheel-dir") + 1])
+        with ZipFile(
+            wheel_dir / "hermes_agent-0.19.0-py3-none-any.whl", "w"
+        ) as archive:
+            archive.writestr("hermes_cli/tui_dist/entry.js", "entry")
+
+    monkeypatch.setattr(
+        offline_install,
+        "_prepare_tui",
+        lambda _repo: (node, b"license", "v22.0.0"),
+    )
+    monkeypatch.setattr(offline_install.venv, "EnvBuilder", FakeVenvBuilder)
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+
+    offline_install.build_bundle(
+        tmp_path / "bundle", [], Path(__file__).parents[2]
+    )
+
+    assert calls[0][1]["env"]["HERMES_OFFLINE_BUILD"] == "1"
+
+
+def test_provision_desktop_runtime_places_skills_at_the_runtime_resolver_path(
+    tmp_path, monkeypatch
+):
+    bundle = tmp_path / "bundle"
+    for name in ("python", "node", "playwright", "git", "desktop"):
+        (bundle / name).mkdir(parents=True)
+    (bundle / "python" / "python.exe").touch()
+    (bundle / "node" / "node.exe").touch()
+    (bundle / "skills" / "example").mkdir(parents=True)
+    (bundle / "skills" / "example" / "SKILL.md").write_text("# Example\n")
+    (bundle / "wheels").mkdir()
+
+    def fake_run(command, **_kwargs):
+        if command[1:3] == ["-m", "venv"]:
+            venv_root = Path(command[-1])
+            (venv_root / "Scripts").mkdir(parents=True)
+            (venv_root / "Scripts" / "python.exe").touch()
+            (venv_root / "Lib" / "site-packages").mkdir(parents=True)
+
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        offline_install, "_validate_desktop_runtime", lambda *_: None
+    )
+    root, node, playwright, git = (
+        tmp_path / name for name in ("root", "node", "playwright", "git")
+    )
+
+    offline_install._provision_desktop_runtime(
+        bundle,
+        tmp_path / "home",
+        {"hermes_version": "1.2.3", "extras": [], "source_commit": "deadbeef"},
+        [root, node, playwright, git],
+    )
+
+    installed_skill = (
+        root
+        / "venv"
+        / "Lib"
+        / "site-packages"
+        / "skills"
+        / "example"
+        / "SKILL.md"
+    )
+    assert installed_skill.is_file()
+    assert not (root / "venv" / "skills").exists()
+
+
+def test_prepare_chromium_reuses_a_complete_official_cache(tmp_path, monkeypatch):
+    chrome = tmp_path / ".agent-browser" / "browsers" / "chrome-1.2.3" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.touch()
+
+    monkeypatch.setattr(offline_install.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("cached Chrome must not download again"),
+    )
+
+    offline_install._prepare_chromium(tmp_path / "node", tmp_path / "playwright")
+
+    assert (tmp_path / "playwright" / "chromium-1.2.3" / "chrome.exe").is_file()
 
 
 def test_node_license_downloads_exact_version_when_not_installed(tmp_path, monkeypatch):
@@ -385,11 +485,10 @@ def test_finish_desktop_install_stamps_offline_method_and_syncs_skills(
 
     offline_install._finish_desktop_install(home, root)
 
-    from hermes_cli.config import detect_install_method, is_unsupported_install_method
+    from hermes_cli.config import detect_install_method
 
     method = detect_install_method(site_packages)
     assert method == "offline"
-    assert not is_unsupported_install_method(method)
     assert len(calls) == 1
     command, kwargs = calls[0]
     assert command[:2] == [str(python), "-c"]

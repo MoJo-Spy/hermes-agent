@@ -479,6 +479,17 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["can_update_hermes"] is False
 
+    def test_get_status_hides_update_capability_in_offline_edition(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "offline")
+
+        resp = self.client.get("/api/status")
+
+        assert resp.status_code == 200
+        assert resp.json()["can_update_hermes"] is False
+
     def test_dashboard_update_capability_detects_generic_container(self, monkeypatch):
         import hermes_constants
         import hermes_cli.web_server as web_server
@@ -2560,6 +2571,28 @@ class TestWebServerEndpoints:
         assert status_data["exit_code"] == 1
         assert status_data["pid"] is None
         assert any("docker pull nousresearch/hermes-agent:latest" in line for line in status_data["lines"])
+
+    def test_update_hermes_returns_offline_guidance_without_spawning(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        def fail_spawn(*_args, **_kwargs):
+            raise AssertionError("offline update guard should not spawn hermes update")
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "offline")
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fail_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["pid"] is None
+        assert data["error"] == "offline_update_unsupported"
+        assert data["message"] == "Run a newer Hermes offline installer to update this edition."
+        assert data["update_command"] == data["message"]
 
     def test_update_hermes_returns_nix_guidance_without_spawning(self, monkeypatch):
         import hermes_cli.web_server as web_server

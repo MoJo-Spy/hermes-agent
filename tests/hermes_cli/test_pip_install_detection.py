@@ -41,6 +41,15 @@ def test_stamp_file_takes_precedence(tmp_path):
         assert detect_install_method(project_root=tmp_path) == "docker"
 
 
+def test_offline_stamp_file_is_detected(tmp_path):
+    """Offline installers stamp the running site-packages tree as offline."""
+    (tmp_path / ".install_method").write_text("offline\n")
+    with patch("hermes_cli.config.get_managed_system", return_value=None), \
+         patch("hermes_cli.config.get_hermes_home", return_value=tmp_path):
+        from hermes_cli.config import detect_install_method
+        assert detect_install_method(project_root=tmp_path) == "offline"
+
+
 @pytest.mark.parametrize("retired_method", ["pip", "homebrew"])
 def test_code_scoped_retired_stamp_falls_back_to_unknown(tmp_path, retired_method):
     """Removed install methods must not survive in an upgraded code stamp."""
@@ -187,6 +196,15 @@ def test_container_unknown_install_without_stamp_is_unknown(tmp_path):
 def test_recommended_update_command_docker():
     from hermes_cli.config import recommended_update_command_for_method
     assert "docker pull" in recommended_update_command_for_method("docker")
+
+
+def test_recommended_update_command_offline():
+    from hermes_cli.config import recommended_update_command_for_method
+
+    assert (
+        recommended_update_command_for_method("offline")
+        == "Run a newer Hermes offline installer to update this edition."
+    )
 
 
 def test_recommended_update_command_nix():

@@ -76,6 +76,7 @@ from hermes_cli.config import (
     check_config_version,
     detect_install_method,
     format_docker_update_message,
+    format_offline_update_message,
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
@@ -3273,7 +3274,10 @@ async def get_status(profile: Optional[str] = None):
             "release_date": __release_date__,
             "config_version": current_ver,
             "latest_config_version": latest_ver,
-            "can_update_hermes": not _dashboard_local_update_managed_externally(),
+            "can_update_hermes": (
+                not _dashboard_local_update_managed_externally()
+                and detect_install_method(PROJECT_ROOT) != "offline"
+            ),
             "gateway_running": gateway_running,
             "gateway_state": gateway_state,
             "gateway_platforms": gateway_platforms,
@@ -4159,6 +4163,18 @@ async def update_hermes():
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
+    if install_method == "offline":
+        message = format_offline_update_message()
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "offline_update_unsupported",
+            "message": message,
+            "update_command": message,
+        }
+
     if install_method == "docker":
         message = format_docker_update_message()
         _record_completed_action("hermes-update", message, exit_code=1)
@@ -4304,6 +4320,10 @@ async def check_hermes_update(force: bool = False):
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
+        return payload
+
+    if install_method == "offline":
+        payload["message"] = format_offline_update_message()
         return payload
 
     # banner.check_for_updates() handles git / nix-revision paths and

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -11,7 +12,13 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.CompletedProcess[str]:
+def _build_artifact(
+    kind: str,
+    tmp_path,
+    *,
+    nix_build: bool = False,
+    offline_build: bool = False,
+) -> subprocess.CompletedProcess[str]:
     """Invoke the real PEP 517 hook (build_sdist / build_wheel) as a subprocess.
 
     The wheel and sdist guards live in SEPARATE cmdclass entries in setup.py
@@ -27,6 +34,10 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
         env["HERMES_NIX_BUILD"] = "1"
     else:
         env.pop("HERMES_NIX_BUILD", None)
+    if offline_build:
+        env["HERMES_OFFLINE_BUILD"] = "1"
+    else:
+        env.pop("HERMES_OFFLINE_BUILD", None)
     # Redirect setuptools' scratch dirs (build/, *.egg-info) into tmp_path so
     # the allowed-marker build doesn't litter the real worktree.
     scratch = tmp_path / "scratch"
@@ -70,3 +81,39 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
 
     assert result.returncode == 0, result.stderr
     assert list(tmp_path.glob(artifact_glob))
+
+
+def test_offline_marker_allows_only_the_self_contained_wheel(tmp_path):
+    result = _build_artifact("wheel", tmp_path, offline_build=True)
+
+    assert result.returncode == 0, result.stderr
+    wheel = next(tmp_path.glob("hermes_agent-*.whl"))
+    with ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+
+    expected_locales = {
+        path.relative_to(PROJECT_ROOT).as_posix()
+        for path in (PROJECT_ROOT / "locales").glob("*.yaml")
+    }
+    expected_mcp_manifests = {
+        path.relative_to(PROJECT_ROOT).as_posix()
+        for path in (PROJECT_ROOT / "optional-mcps").glob("*/manifest.yaml")
+    }
+    assert (
+        {
+            "hermes_cli/tui_dist/entry.js",
+            "gateway/assets/status_phrases.yaml",
+            "plugins/platforms/telegram/plugin.yaml",
+            "plugins/hermes-achievements/dashboard/manifest.json",
+            "plugins/hermes-achievements/dashboard/dist/index.js",
+        }
+        | expected_locales
+        | expected_mcp_manifests
+    ) <= names
+
+
+def test_offline_marker_does_not_allow_an_sdist(tmp_path):
+    result = _build_artifact("sdist", tmp_path, offline_build=True)
+
+    assert result.returncode != 0
+    assert "Building wheels or sdists for hermes-agent is not supported" in result.stderr
