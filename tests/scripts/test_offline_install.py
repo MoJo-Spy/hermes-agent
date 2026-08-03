@@ -9,6 +9,88 @@ import pytest
 from scripts import offline_install
 
 
+def _write_toolchain_manifest(repo: Path) -> None:
+    repo.mkdir()
+    (repo / "package.json").write_text(
+        json.dumps(
+            {
+                "engines": {
+                    "node": ">=22.22.0",
+                    "npm": "<11.10.0 || >=11.17.0",
+                }
+            }
+        )
+    )
+    (repo / "package-lock.json").write_text("{}")
+
+
+@pytest.mark.parametrize(
+    ("node_version", "npm_version", "engine"),
+    [
+        ("v22.21.1", "10.9.8", "node"),
+        ("v22.22.0", "11.10.0", "npm"),
+    ],
+)
+def test_prepare_tui_rejects_toolchains_outside_manifest_before_npm_install(
+    tmp_path, monkeypatch, node_version, npm_version, engine
+):
+    repo = tmp_path / "repo"
+    _write_toolchain_manifest(repo)
+    node = tmp_path / "node.exe"
+    npm = tmp_path / "npm.cmd"
+    node.touch()
+    npm.touch()
+    versions = {str(node): node_version, str(npm): npm_version}
+
+    monkeypatch.setattr(
+        offline_install.shutil,
+        "which",
+        lambda command: {"node": str(node), "npm": str(npm)}.get(command),
+    )
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "check_output",
+        lambda command, **_kwargs: versions[command[0]],
+    )
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("npm install must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match=rf"engines\.{engine}"):
+        offline_install._prepare_tui(repo)
+
+
+def test_offline_toolchain_preflight_accepts_manifest_contract(tmp_path):
+    repo = tmp_path / "repo"
+    _write_toolchain_manifest(repo)
+
+    offline_install._validate_builder_toolchain(repo, "v22.22.0", "10.9.8")
+    offline_install._validate_portable_node_version(repo, "22.22.0")
+
+
+def test_prepare_portable_node_rejects_old_resolved_node_before_download(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _write_toolchain_manifest(repo)
+
+    monkeypatch.setattr(
+        offline_install,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(b"node-v22.21.1-win-x64.zip"),
+    )
+    monkeypatch.setattr(
+        offline_install,
+        "_download",
+        lambda *_args, **_kwargs: pytest.fail("old Node must not download"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"resolved portable Node.js.*engines\.node"):
+        offline_install._prepare_portable_node(tmp_path / "node", repo)
+
+
 def test_windows_powershell_paths_are_passed_through_environment(monkeypatch):
     calls = []
 

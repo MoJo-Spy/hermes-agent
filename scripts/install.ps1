@@ -1217,7 +1217,7 @@ function Test-Node {
             $script:HasNode = $true
             return $true
         }
-        Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
+        Write-Warn "Node.js $version is too old (Hermes requires Node >=22.22.0)"
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.

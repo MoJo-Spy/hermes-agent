@@ -38,7 +38,7 @@ _STOCK_NPM_BY_NODE_MAJOR = {
 
 
 def _root_manifest() -> dict:
-    return json.loads((REPO_ROOT / "package.json").read_text())
+    return json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
 
 
 def _parse_major_minor_patch(version: str) -> tuple[int, int, int]:
@@ -109,7 +109,9 @@ class TestEnginesAreSatisfiable:
     def test_node_floor_is_met_by_the_managed_runtime(self):
         """The Node major the installers provision must clear engines.node."""
         node_range = _root_manifest()["engines"]["node"]
-        install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text()
+        install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text(
+            encoding="utf-8"
+        )
         for line in install_sh.splitlines():
             if line.startswith("NODE_VERSION="):
                 managed_major = int(line.split("=", 1)[1].strip().strip('"').strip("'"))
@@ -130,6 +132,17 @@ class TestEnginesAreSatisfiable:
             f"{managed_major}.x. The runtime we ship must satisfy the floor we "
             "declare, or the install we just performed cannot install deps."
         )
+
+    def test_installer_node_floor_warning_matches_the_manifest(self):
+        """A rejected system Node must be described with the actual hard floor."""
+        node_range = _root_manifest()["engines"]["node"]
+        match = re.fullmatch(r">=\s*v?(\d+\.\d+\.\d+)", node_range)
+        assert match, f"cannot read a single lower bound out of {node_range!r}"
+        expected = f"Hermes requires Node >={match.group(1)}"
+        for installer in ("install.sh", "install.ps1"):
+            text = (REPO_ROOT / "scripts" / installer).read_text(encoding="utf-8")
+            assert expected in text
+            assert "Hermes requires Node >=26" not in text
 
     def test_desktop_node_floor_is_not_stricter_than_its_toolchain(self):
         """apps/desktop must not demand more Node than its own build tools do.
@@ -181,5 +194,7 @@ class TestManifestMirrors:
     def test_lockfile_engines_match_the_manifest(self):
         """A stale lockfile mirror re-imposes the old floor on `npm ci`."""
         manifest = _root_manifest()["engines"]
-        lock = json.loads((REPO_ROOT / "package-lock.json").read_text())
+        lock = json.loads(
+            (REPO_ROOT / "package-lock.json").read_text(encoding="utf-8")
+        )
         assert lock["packages"][""]["engines"] == manifest

@@ -30,6 +30,8 @@ OFFLINE_MARKER = "offline-install.json"
 EXE_MAGIC = b"HERMES_OFFLINE_1"
 EXE_FOOTER = struct.Struct("<16sQ32s")
 _SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_TOOL_VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
+_ENGINE_COMPARATOR = re.compile(r"^(>=|<=|>|<|=)?\s*v?(\d+\.\d+\.\d+)$")
 
 
 def _runtime() -> dict[str, str]:
@@ -72,18 +74,99 @@ def _node_license(node_path: Path, node_version: str) -> bytes:
         ) from exc
 
 
+def _tool_version(value: str, tool: str) -> tuple[int, int, int]:
+    match = _TOOL_VERSION.fullmatch(value.strip())
+    if not match:
+        raise RuntimeError(f"could not parse {tool} version: {value!r}")
+    return tuple(map(int, match.groups()))
+
+
+def _toolchain_engines(repo: Path) -> dict[str, str]:
+    package = repo / "package.json"
+    try:
+        engines = json.loads(package.read_text(encoding="utf-8"))["engines"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"could not read Node.js and npm engines from {package}"
+        ) from exc
+    if not isinstance(engines, dict):
+        raise RuntimeError(f"{package} must declare an engines object")
+    node = engines.get("node")
+    npm = engines.get("npm")
+    if not isinstance(node, str) or not isinstance(npm, str):
+        raise RuntimeError(f"{package} must declare string engines.node and engines.npm")
+    return {"node": node, "npm": npm}
+
+
+def _satisfies_engine(version: str, engine: str, tool: str) -> bool:
+    actual = _tool_version(version, tool)
+    for alternative in engine.split("||"):
+        clauses = alternative.split()
+        if clauses and all(
+            _satisfies_engine_clause(actual, clause, tool) for clause in clauses
+        ):
+            return True
+    return False
+
+
+def _satisfies_engine_clause(
+    actual: tuple[int, int, int], clause: str, tool: str
+) -> bool:
+    match = _ENGINE_COMPARATOR.fullmatch(clause)
+    if not match:
+        raise RuntimeError(
+            f"unsupported {tool} engine constraint in package.json: {clause!r}"
+        )
+    operator = match.group(1) or "="
+    required = _tool_version(match.group(2), tool)
+    if operator == ">=":
+        return actual >= required
+    if operator == "<=":
+        return actual <= required
+    if operator == ">":
+        return actual > required
+    if operator == "<":
+        return actual < required
+    return actual == required
+
+
+def _validate_engine_version(
+    source: str, engine_name: str, version: str, engine: str
+) -> None:
+    tool = "Node.js" if engine_name == "node" else "npm"
+    if not _satisfies_engine(version, engine, tool):
+        raise RuntimeError(
+            f"{source} {tool} {version} does not satisfy "
+            f"package.json engines.{engine_name} ({engine})"
+        )
+
+
+def _validate_builder_toolchain(repo: Path, node_version: str, npm_version: str) -> None:
+    engines = _toolchain_engines(repo)
+    _validate_engine_version("builder", "node", node_version, engines["node"])
+    _validate_engine_version("builder", "npm", npm_version, engines["npm"])
+
+
+def _validate_portable_node_version(repo: Path, node_version: str) -> None:
+    _validate_engine_version(
+        "resolved portable", "node", node_version, _toolchain_engines(repo)["node"]
+    )
+
+
 def _prepare_tui(repo: Path) -> tuple[Path, bytes, str]:
     node = shutil.which("node")
     npm = shutil.which("npm")
     if not node or not npm:
-        raise RuntimeError("Node.js 20+ and npm are required to build the offline TUI")
+        raise RuntimeError("Node.js and npm are required to build the offline TUI")
 
     node_path = Path(node)
     node_version = subprocess.check_output(
         [node, "--version"], text=True, encoding="utf-8"
     ).strip()
-    if int(node_version.removeprefix("v").split(".", 1)[0]) < 20:
-        raise RuntimeError(f"Node.js 20+ is required, found {node_version}")
+    npm_version = subprocess.check_output(
+        [npm, "--version"], text=True, encoding="utf-8"
+    ).strip()
+    _validate_builder_toolchain(repo, node_version, npm_version)
     license_content = _node_license(node_path, node_version)
 
     lock = repo / "package-lock.json"
@@ -205,6 +288,7 @@ def _prepare_portable_node(target: Path, repo: Path) -> tuple[str, str]:
         raise RuntimeError("could not resolve the current Node.js 22 Windows x64 ZIP")
 
     node_version = match.group(1)
+    _validate_portable_node_version(repo, node_version)
     zip_name = match.group(0)
     with tempfile.TemporaryDirectory() as temp:
         temp_path = Path(temp)
