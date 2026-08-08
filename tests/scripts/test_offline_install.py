@@ -1,10 +1,258 @@
 import hashlib
 import io
 import json
+from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
 from scripts import offline_install
+
+
+def _write_toolchain_manifest(repo: Path) -> None:
+    repo.mkdir()
+    (repo / "package.json").write_text(
+        json.dumps(
+            {
+                "engines": {
+                    "node": ">=22.22.0",
+                    "npm": "<11.10.0 || >=11.17.0",
+                }
+            }
+        )
+    )
+    (repo / "package-lock.json").write_text("{}")
+
+
+@pytest.mark.parametrize(
+    ("node_version", "npm_version", "engine"),
+    [
+        ("v22.21.1", "10.9.8", "node"),
+        ("v22.22.0", "11.10.0", "npm"),
+    ],
+)
+def test_prepare_tui_rejects_toolchains_outside_manifest_before_npm_install(
+    tmp_path, monkeypatch, node_version, npm_version, engine
+):
+    repo = tmp_path / "repo"
+    _write_toolchain_manifest(repo)
+    node = tmp_path / "node.exe"
+    npm = tmp_path / "npm.cmd"
+    node.touch()
+    npm.touch()
+    versions = {str(node): node_version, str(npm): npm_version}
+
+    monkeypatch.setattr(
+        offline_install.shutil,
+        "which",
+        lambda command: {"node": str(node), "npm": str(npm)}.get(command),
+    )
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "check_output",
+        lambda command, **_kwargs: versions[command[0]],
+    )
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("npm install must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match=rf"engines\.{engine}"):
+        offline_install._prepare_tui(repo)
+
+
+def test_offline_toolchain_preflight_accepts_manifest_contract(tmp_path):
+    repo = tmp_path / "repo"
+    _write_toolchain_manifest(repo)
+
+    offline_install._validate_builder_toolchain(repo, "v22.22.0", "10.9.8")
+    offline_install._validate_portable_node_version(repo, "22.22.0")
+
+
+def test_prepare_portable_node_rejects_old_resolved_node_before_download(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _write_toolchain_manifest(repo)
+
+    monkeypatch.setattr(
+        offline_install,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(b"node-v22.21.1-win-x64.zip"),
+    )
+    monkeypatch.setattr(
+        offline_install,
+        "_download",
+        lambda *_args, **_kwargs: pytest.fail("old Node must not download"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"resolved portable Node.js.*engines\.node"):
+        offline_install._prepare_portable_node(tmp_path / "node", repo)
+
+
+def test_windows_powershell_paths_are_passed_through_environment(monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Result()
+
+    monkeypatch.setattr(offline_install.sys, "platform", "win32")
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+    home = Path(r"C:\Users\admin\AppData\Local\hermes path")
+    desktop = home / "hermes-agent" / "apps" / "desktop" / "Hermes.exe"
+
+    offline_install._stop_hermes_processes(home)
+    offline_install._create_shortcuts(desktop)
+
+    for (command, kwargs), expected in zip(calls, (home, desktop), strict=True):
+        assert command[-2] == "-Command"
+        assert str(expected) not in command
+        assert "$env:HERMES_INSTALLER_ARGUMENT" in command[-1]
+        assert kwargs["env"]["HERMES_INSTALLER_ARGUMENT"] == str(expected)
+    stop_script = calls[0][0][-1]
+    assert "ParentProcessId" in stop_script
+    assert "foreach ($process in $roots)" in stop_script
+
+
+def test_build_bundle_marks_its_private_wheel_subprocess_offline(tmp_path, monkeypatch):
+    node = tmp_path / "node.exe"
+    node.write_bytes(b"node")
+    calls = []
+
+    class FakeVenvBuilder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create(self, target):
+            Path(target).mkdir(parents=True)
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        wheel_dir = Path(command[command.index("--wheel-dir") + 1])
+        with ZipFile(
+            wheel_dir / "hermes_agent-0.19.0-py3-none-any.whl", "w"
+        ) as archive:
+            archive.writestr("hermes_cli/tui_dist/entry.js", "entry")
+
+    monkeypatch.setattr(
+        offline_install,
+        "_prepare_tui",
+        lambda _repo: (node, b"license", "v22.0.0"),
+    )
+    monkeypatch.setattr(offline_install.venv, "EnvBuilder", FakeVenvBuilder)
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+
+    offline_install.build_bundle(
+        tmp_path / "bundle", [], Path(__file__).parents[2]
+    )
+
+    assert calls[0][1]["env"]["HERMES_OFFLINE_BUILD"] == "1"
+
+
+def test_provision_desktop_runtime_places_skills_at_the_runtime_resolver_path(
+    tmp_path, monkeypatch
+):
+    bundle = tmp_path / "bundle"
+    for name in ("python", "node", "playwright", "git", "desktop"):
+        (bundle / name).mkdir(parents=True)
+    (bundle / "python" / "python.exe").touch()
+    (bundle / "node" / "node.exe").touch()
+    (bundle / "skills" / "example").mkdir(parents=True)
+    (bundle / "skills" / "example" / "SKILL.md").write_text("# Example\n")
+    (bundle / "wheels").mkdir()
+
+    def fake_run(command, **_kwargs):
+        if command[1:3] == ["-m", "venv"]:
+            venv_root = Path(command[-1])
+            (venv_root / "Scripts").mkdir(parents=True)
+            (venv_root / "Scripts" / "python.exe").touch()
+            (venv_root / "Lib" / "site-packages").mkdir(parents=True)
+
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        offline_install, "_validate_desktop_runtime", lambda *_: None
+    )
+    root, node, playwright, git = (
+        tmp_path / name for name in ("root", "node", "playwright", "git")
+    )
+
+    offline_install._provision_desktop_runtime(
+        bundle,
+        tmp_path / "home",
+        {"hermes_version": "1.2.3", "extras": [], "source_commit": "deadbeef"},
+        [root, node, playwright, git],
+    )
+
+    installed_skill = (
+        root
+        / "venv"
+        / "Lib"
+        / "site-packages"
+        / "skills"
+        / "example"
+        / "SKILL.md"
+    )
+    assert installed_skill.is_file()
+    assert not (root / "venv" / "skills").exists()
+
+
+def test_prepare_chromium_reuses_a_complete_official_cache(tmp_path, monkeypatch):
+    chrome = tmp_path / ".agent-browser" / "browsers" / "chrome-1.2.3" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.touch()
+
+    monkeypatch.setattr(offline_install.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("cached Chrome must not download again"),
+    )
+
+    offline_install._prepare_chromium(tmp_path / "node", tmp_path / "playwright")
+
+    assert (tmp_path / "playwright" / "chromium-1.2.3" / "chrome.exe").is_file()
+
+
+def test_prepare_desktop_builds_restores_lockfile_before_pack(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    lock_path = repo / "package-lock.json"
+    lock_path.parent.mkdir()
+    lock_path.write_bytes(b"committed lockfile")
+    desktop = repo / "apps" / "desktop" / "release" / "win-unpacked" / "Hermes.exe"
+    bootstrap = (
+        repo
+        / "apps"
+        / "bootstrap-installer"
+        / "src-tauri"
+        / "target"
+        / "release"
+        / "Hermes-Setup.exe"
+    )
+    desktop.parent.mkdir(parents=True)
+    bootstrap.parent.mkdir(parents=True)
+    desktop.touch()
+    bootstrap.touch()
+    lockfiles_seen_by_pack = []
+
+    def fake_run(command, **_kwargs):
+        if command[1] == "install":
+            lock_path.write_bytes(b"transient npm rewrite")
+        else:
+            lockfiles_seen_by_pack.append(lock_path.read_bytes())
+
+    monkeypatch.setattr(offline_install.shutil, "which", lambda _name: "npm")
+    monkeypatch.setattr(offline_install.subprocess, "run", fake_run)
+
+    assert offline_install._prepare_desktop_builds(repo) == (desktop.parent, bootstrap)
+    assert lockfiles_seen_by_pack == [b"committed lockfile", b"committed lockfile"]
+    assert lock_path.read_bytes() == b"committed lockfile"
 
 
 def test_node_license_downloads_exact_version_when_not_installed(tmp_path, monkeypatch):
@@ -24,6 +272,38 @@ def test_node_license_downloads_exact_version_when_not_installed(tmp_path, monke
         "url": "https://raw.githubusercontent.com/nodejs/node/v24.18.0/LICENSE",
         "timeout": 30,
     }
+
+
+def test_portable_git_uses_github_token(tmp_path, monkeypatch):
+    requested = {}
+    release = {
+        "tag_name": "v1",
+        "assets": [
+            {
+                "name": "PortableGit-test-64-bit.7z.exe",
+                "browser_download_url": "https://example.test/git.exe",
+            }
+        ],
+    }
+
+    def fake_urlopen(request, timeout):
+        requested.update(headers=dict(request.header_items()), timeout=timeout)
+        return io.BytesIO(json.dumps(release).encode())
+
+    def fake_download(url, destination, headers):
+        requested.update(download_url=url, download_headers=headers)
+        destination.touch()
+
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "bash.exe").touch()
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setattr(offline_install, "urlopen", fake_urlopen)
+    monkeypatch.setattr(offline_install, "_download", fake_download)
+    monkeypatch.setattr(offline_install.subprocess, "run", lambda *args, **kwargs: None)
+
+    assert offline_install._prepare_portable_git(tmp_path) == "v1"
+    assert requested["headers"]["Authorization"] == "Bearer test-token"
+    assert requested["download_headers"]["Authorization"] == "Bearer test-token"
 
 
 def _write_runtime(bundle):
@@ -104,3 +384,260 @@ def test_install_rejects_nonempty_target(tmp_path):
 
     with pytest.raises(FileExistsError, match="not empty"):
         offline_install.install_bundle(bundle, target)
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [(None, "install"), ("1.2.3", "repair"), ("1.2.2", "upgrade")],
+)
+def test_desktop_install_action(installed, expected):
+    assert offline_install._desktop_install_action("1.2.3", installed) == expected
+
+
+def test_desktop_install_action_rejects_downgrade():
+    with pytest.raises(RuntimeError, match=r"downgrade.*1\.2\.3.*1\.2\.2"):
+        offline_install._desktop_install_action("1.2.2", "1.2.3")
+
+
+def _write_desktop_bundle(bundle: Path, version: str = "1.2.3") -> dict:
+    files = {
+        "python/python.exe": b"python",
+        "wheels/hermes_agent-1.2.3-py3-none-any.whl": b"wheel",
+        "node/node.exe": b"node",
+        "node/agent-browser.cmd": b"agent-browser",
+        "git/bin/bash.exe": b"bash",
+        "git/cmd/git.exe": b"git",
+        "playwright/chromium-1/chrome.exe": b"chromium",
+        "desktop/Hermes.exe": b"desktop",
+        "offline_install.py": b"installer",
+        "skills/example/SKILL.md": b"---\nname: example\n---\n",
+    }
+    for relative, content in files.items():
+        path = bundle / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    manifest = {
+        "format": offline_install.DESKTOP_FORMAT,
+        "kind": "windows-x64-desktop",
+        "hermes_version": version,
+        "source_commit": "a" * 40,
+        "files": {
+            relative: hashlib.sha256(content).hexdigest()
+            for relative, content in files.items()
+        },
+    }
+    (bundle / offline_install.MANIFEST).write_text(json.dumps(manifest))
+    return manifest
+
+
+def test_load_desktop_bundle_rejects_extra_or_corrupt_payload(tmp_path):
+    manifest = _write_desktop_bundle(tmp_path)
+    assert offline_install._load_desktop_bundle(tmp_path) == manifest
+
+    extra = tmp_path / "unexpected"
+    extra.write_bytes(b"extra")
+    with pytest.raises(RuntimeError, match="contents do not match"):
+        offline_install._load_desktop_bundle(tmp_path)
+    extra.unlink()
+
+    (tmp_path / "desktop" / "Hermes.exe").write_bytes(b"corrupt")
+    with pytest.raises(RuntimeError, match="missing or corrupt payload file"):
+        offline_install._load_desktop_bundle(tmp_path)
+
+
+def test_load_desktop_bundle_requires_bundled_skills(tmp_path):
+    manifest = _write_desktop_bundle(tmp_path)
+    skill = "skills/example/SKILL.md"
+    (tmp_path / skill).unlink()
+    manifest["files"].pop(skill)
+    (tmp_path / offline_install.MANIFEST).write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="bundled skills are missing"):
+        offline_install._load_desktop_bundle(tmp_path)
+
+
+def test_append_payload_exe_writes_verifiable_footer(tmp_path):
+    stub = tmp_path / "stub.exe"
+    archive = tmp_path / "payload.zip"
+    output = tmp_path / "offline.exe"
+    stub.write_bytes(b"MZ-stub")
+    archive.write_bytes(b"zip-payload")
+
+    offline_install._append_payload_exe(stub, archive, output)
+
+    length, digest = offline_install._read_exe_footer(output)
+    assert length == archive.stat().st_size
+    assert digest == hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert output.read_bytes().startswith(stub.read_bytes() + archive.read_bytes())
+
+
+def test_desktop_install_restores_partial_swap(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    manifest = _write_desktop_bundle(bundle, version="2.0.0")
+    home = tmp_path / "home"
+    root = home / "hermes-agent"
+    node = home / "node"
+    root.mkdir(parents=True)
+    node.mkdir()
+    (root / "old-runtime").write_text("old")
+    (node / "old-node").write_text("old")
+    (home / offline_install.OFFLINE_MARKER).write_text(
+        json.dumps({"format": 1, "version": "1.0.0"})
+    )
+
+    monkeypatch.setattr(offline_install, "_load_desktop_bundle", lambda _: manifest)
+    monkeypatch.setattr(offline_install, "_stop_hermes_processes", lambda *_: None)
+
+    def provision_staging(_bundle, _home, _manifest, paths):
+        for path in paths:
+            path.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        offline_install, "_provision_desktop_runtime", provision_staging
+    )
+    original_replace = Path.replace
+
+    def fail_node_swap(path, target):
+        if path == node and Path(target).name == ".node.rollback":
+            raise OSError("injected lock")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_node_swap)
+
+    with pytest.raises(RuntimeError, match="close all Hermes processes"):
+        offline_install.install_desktop_bundle(bundle, home)
+
+    assert (root / "old-runtime").read_text() == "old"
+    assert (node / "old-node").read_text() == "old"
+
+
+def test_desktop_install_rolls_back_runtime_and_marker(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    manifest = _write_desktop_bundle(bundle, version="2.0.0")
+    home = tmp_path / "home"
+    root = home / "hermes-agent"
+    node = home / "node"
+    playwright = home / "playwright"
+    git = home / "git"
+    root.mkdir(parents=True)
+    node.mkdir()
+    playwright.mkdir()
+    git.mkdir()
+    (root / "old-runtime").write_text("old")
+    (node / "old-node").write_text("old")
+    (playwright / "old-browser").write_text("old")
+    (git / "old-git").write_text("old")
+    old_marker = {"format": 1, "version": "1.0.0"}
+    (home / offline_install.OFFLINE_MARKER).write_text(json.dumps(old_marker))
+
+    monkeypatch.setattr(offline_install, "_load_desktop_bundle", lambda _: manifest)
+    monkeypatch.setattr(offline_install, "_stop_hermes_processes", lambda *_: None)
+
+    def provision_staging(_bundle, _home, _manifest, paths):
+        for path in paths:
+            path.mkdir(parents=True)
+            (path / "new").write_text("new")
+
+    monkeypatch.setattr(
+        offline_install, "_provision_desktop_runtime", provision_staging
+    )
+    monkeypatch.setattr(offline_install, "_relocate_staged_venv", lambda *_: None)
+
+    def fail_final_validation(*_args):
+        raise RuntimeError("injected final validation failure")
+
+    monkeypatch.setattr(
+        offline_install, "_validate_desktop_runtime", fail_final_validation
+    )
+
+    with pytest.raises(RuntimeError, match="injected final validation failure"):
+        offline_install.install_desktop_bundle(bundle, home)
+
+    assert (root / "old-runtime").read_text() == "old"
+    assert (node / "old-node").read_text() == "old"
+    assert (playwright / "old-browser").read_text() == "old"
+    assert (git / "old-git").read_text() == "old"
+    assert json.loads((home / offline_install.OFFLINE_MARKER).read_text()) == old_marker
+    assert not (home / "hermes-agent.previous").exists()
+
+
+def test_relocate_staged_venv_rewrites_equal_length_paths(tmp_path):
+    staged = tmp_path / ".hermes-next"
+    final = tmp_path / "hermes-agent"
+    scripts = final / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    (final / "venv" / "pyvenv.cfg").write_text(f"home = {staged}\\python\n")
+    launcher = scripts / "hermes.exe"
+    launcher.write_bytes(b"prefix" + str(staged).encode() + b"suffix")
+
+    offline_install._relocate_staged_venv(staged, final)
+
+    assert str(final) in (final / "venv" / "pyvenv.cfg").read_text()
+    assert str(staged).encode() not in launcher.read_bytes()
+    assert str(final).encode() in launcher.read_bytes()
+
+
+def test_finish_desktop_install_stamps_offline_method_and_syncs_skills(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    root = home / "hermes-agent"
+    python = root / "venv" / "Scripts" / "python.exe"
+    site_packages = root / "venv" / "Lib" / "site-packages"
+    desktop = root / "apps" / "desktop" / "release" / "win-unpacked" / "Hermes.exe"
+    python.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    desktop.parent.mkdir(parents=True)
+    python.touch()
+    desktop.touch()
+    calls = []
+    monkeypatch.setattr(offline_install, "_create_shortcuts", lambda *_: None)
+    monkeypatch.setattr(
+        offline_install.subprocess,
+        "run",
+        lambda args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    offline_install._finish_desktop_install(home, root)
+
+    from hermes_cli.config import detect_install_method
+
+    method = detect_install_method(site_packages)
+    assert method == "offline"
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[:2] == [str(python), "-c"]
+    assert "list_profiles" in command[2]
+    assert "seed_profile_skills" in command[2]
+    assert kwargs == {
+        "env": {**offline_install.os.environ, "HERMES_HOME": str(home)},
+        "check": True,
+    }
+
+
+def test_desktop_exe_includes_anthropic_by_default(tmp_path, monkeypatch):
+    captured = {}
+    output = tmp_path / "Hermes-Offline-Setup.exe"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        offline_install,
+        "build_desktop_exe",
+        lambda actual_output, extras, repo: captured.update(
+            output=actual_output, extras=extras, repo=repo
+        ),
+    )
+    monkeypatch.setattr(
+        offline_install.sys,
+        "argv",
+        ["offline_install.py", "desktop-exe", str(output)],
+    )
+
+    offline_install.main()
+
+    assert captured == {
+        "output": output,
+        "extras": ["all", "anthropic"],
+        "repo": tmp_path,
+    }
